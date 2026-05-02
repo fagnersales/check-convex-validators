@@ -99,6 +99,72 @@ describe("stale field (R2)", () => {
   });
 });
 
+describe("validator spread (...x.fields)", () => {
+  test("clean — spread of plain object inlines fields", () => {
+    const { issues } = go("validator-spread");
+    const errors = issues.filter(
+      (i) => i.severity === "error" && i.function === "getStoreA",
+    );
+    expect(errors).toEqual([]);
+  });
+
+  test("clean — spread of validator .fields inlines fields", () => {
+    const { issues } = go("validator-spread");
+    const errors = issues.filter(
+      (i) => i.severity === "error" && i.function === "getStoreB",
+    );
+    expect(errors).toEqual([]);
+  });
+
+  test("no STALE_FIELD noise from synthetic __spread: keys", () => {
+    const { issues } = go("validator-spread");
+    const stale = issues.filter((i) => i.code === "STALE_FIELD");
+    expect(stale).toEqual([]);
+  });
+});
+
+describe("discriminated union (R14)", () => {
+  test("matches each literal return to the branch whose literal discriminator agrees", () => {
+    const { issues } = go("discriminated-union");
+    const errors = issues.filter((i) => i.severity === "error");
+    expect(errors).toEqual([]);
+  });
+});
+
+describe(".map(c => ({...})) direct return (R11)", () => {
+  test("classifies as literalArray of literal — no MISSING_FIELD against schema", () => {
+    const { issues } = go("map-transform");
+    const errors = issues.filter((i) => i.severity === "error");
+    expect(errors).toEqual([]);
+  });
+});
+
+describe("nested callback returns", () => {
+  test("ignores returns inside nested arrow callbacks (.map(d => return ...))", () => {
+    const { issues } = go("nested-returns");
+    const errors = issues.filter((i) => i.severity === "error");
+    expect(errors).toEqual([]);
+  });
+});
+
+describe("barrel re-export", () => {
+  test("follows `export { x } from \"./y\"` to the original definition", () => {
+    const { codes, issues } = go("barrel-reexport");
+    expect(codes).toContain("MISSING_FIELD");
+    const missing = issues.find((i) => i.code === "MISSING_FIELD")!;
+    expect(missing.message).toContain("cachedBalance");
+  });
+});
+
+describe("const-binding for ctx.db.get", () => {
+  test("traces table through `const id = args.storeId; ctx.db.get(id)`", () => {
+    const { codes, issues } = go("const-binding");
+    expect(codes).toContain("MISSING_FIELD");
+    const missing = issues.find((i) => i.code === "MISSING_FIELD")!;
+    expect(missing.message).toContain("cachedAvailableBalance");
+  });
+});
+
 describe("paginated (R7)", () => {
   test("diffs paginated row shape against schema", () => {
     const { codes, issues } = go("paginated");

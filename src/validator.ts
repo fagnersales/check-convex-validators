@@ -125,10 +125,13 @@ function parseCallValidator(call: CallExpression, depth: number): Shape {
     }
     case "object": {
       const arg = args[0];
-      if (!arg || !Node.isObjectLiteralExpression(arg)) {
-        return { kind: "unknown", reason: "v.object expected object literal" };
+      if (!arg) return { kind: "unknown", reason: "v.object missing arg" };
+      if (Node.isObjectLiteralExpression(arg)) return parseObjectLiteral(arg, depth);
+      if (Node.isIdentifier(arg)) {
+        // `v.object(someConst)` where someConst is a plain object literal of v.* fields
+        return { kind: "ref", symbol: arg.getText() };
       }
-      return parseObjectLiteral(arg, depth);
+      return { kind: "unknown", reason: "v.object expected object literal or identifier" };
     }
     default:
       return { kind: "unknown", reason: `unknown v.${method}` };
@@ -151,10 +154,18 @@ function parseObjectLiteral(obj: ObjectLiteralExpression, depth: number): Shape 
       const name = prop.getName();
       fields.set(name, { shape: { kind: "ref", symbol: name }, optional: false });
     } else if (Node.isSpreadAssignment(prop)) {
-      // spread of another validator object — record as ref under synthetic key
-      const exprText = prop.getExpression().getText();
+      // spread of another validator/object — resolve at resolveNested time.
+      // Two patterns to handle:
+      //   { ...baseFields }              → spread of plain object literal
+      //   { ...baseValidator.fields }    → spread of v.object(...).fields
+      const expr = prop.getExpression();
+      const exprText = expr.getText();
+      let baseSymbol = exprText;
+      if (Node.isPropertyAccessExpression(expr) && expr.getName() === "fields") {
+        baseSymbol = expr.getExpression().getText();
+      }
       fields.set(`__spread:${exprText}`, {
-        shape: { kind: "ref", symbol: exprText },
+        shape: { kind: "ref", symbol: baseSymbol },
         optional: false,
       });
     }
@@ -209,8 +220,26 @@ function resolveNested(
 ): Shape {
   switch (shape.kind) {
     case "object": {
-      const next = new Map(shape.fields);
-      for (const [k, v] of next) {
+      const next = new Map<string, FieldShape>();
+      for (const [k, v] of shape.fields) {
+        if (k.startsWith("__spread:")) {
+          // Try to inline the spread's resolved object fields.
+          const resolved = resolveRef(v.shape, sourceFile, project, seen);
+          if (resolved.kind === "object") {
+            for (const [sk, sv] of resolved.fields) {
+              if (sk.startsWith("__spread:")) {
+                // nested unresolved spread bubbles up
+                if (!next.has(sk)) next.set(sk, sv);
+              } else if (!next.has(sk)) {
+                next.set(sk, sv);
+              }
+            }
+          } else {
+            // unresolved — keep marker so match.ts can suppress noise
+            next.set(k, v);
+          }
+          continue;
+        }
         const r = resolveRef(v.shape, sourceFile, project, seen);
         next.set(k, { shape: r, optional: v.optional });
       }
@@ -241,27 +270,64 @@ function findDefinition(
   sourceFile: SourceFile,
   project: Project,
 ): { node: Node; sourceFile: SourceFile } | null {
-  // local file
+  return findInFile(symbol, sourceFile, project, new Set());
+}
+
+/**
+ * Look up `symbol` in `sourceFile`, following imports and re-exports.
+ * Cycle-safe via `visited` set of file paths.
+ */
+function findInFile(
+  symbol: string,
+  sourceFile: SourceFile,
+  project: Project,
+  visited: Set<string>,
+): { node: Node; sourceFile: SourceFile } | null {
+  const filePath = sourceFile.getFilePath();
+  if (visited.has(filePath)) return null;
+  visited.add(filePath);
+
+  // local definition
   const local = sourceFile.getVariableDeclaration(symbol);
   if (local) {
     const init = local.getInitializer();
     if (init) return { node: init, sourceFile };
   }
 
-  // imports
+  // re-exports: `export { x } from "./y"` or `export { x as y } from "./z"`
+  for (const exp of sourceFile.getExportDeclarations()) {
+    const moduleSpec = exp.getModuleSpecifierValue();
+    if (!moduleSpec) continue;
+    for (const named of exp.getNamedExports()) {
+      const aliasNode = named.getAliasNode();
+      const exportedName = aliasNode ? aliasNode.getText() : named.getName();
+      if (exportedName !== symbol) continue;
+      const sourceName = named.getName();
+      const target = project
+        .getSourceFiles()
+        .find((sf) => moduleResolves(filePath, moduleSpec, sf.getFilePath()));
+      if (!target) continue;
+      const result = findInFile(sourceName, target, project, visited);
+      if (result) return result;
+    }
+  }
+
+  // imports: `import { x } from "./y"` — recurse into target file
   for (const imp of sourceFile.getImportDeclarations()) {
-    const named = imp.getNamedImports().find((n) => n.getName() === symbol);
+    const named = imp.getNamedImports().find((n) => {
+      const aliasNode = n.getAliasNode();
+      const localName = aliasNode ? aliasNode.getText() : n.getName();
+      return localName === symbol;
+    });
     if (!named) continue;
     const moduleSpec = imp.getModuleSpecifierValue();
     const target = project
       .getSourceFiles()
-      .find((sf) => moduleResolves(sourceFile.getFilePath(), moduleSpec, sf.getFilePath()));
+      .find((sf) => moduleResolves(filePath, moduleSpec, sf.getFilePath()));
     if (!target) continue;
-    const decl = target.getVariableDeclaration(symbol);
-    if (decl) {
-      const init = decl.getInitializer();
-      if (init) return { node: init, sourceFile: target };
-    }
+    const sourceName = named.getName();
+    const result = findInFile(sourceName, target, project, visited);
+    if (result) return result;
   }
 
   return null;

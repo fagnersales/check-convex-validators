@@ -75,6 +75,7 @@ type VarOrigin =
   | { kind: "rowsOf"; table: string }
   | { kind: "paginatedOf"; table: string }
   | { kind: "literal"; fields: Map<string, Shape> }
+  | { kind: "idOf"; table: string }
   | { kind: "param" }
   | { kind: "unknown"; expr: string };
 
@@ -92,13 +93,31 @@ function buildScope(handler: HandlerFn, ctx: AnalyzeContext): Scope {
   const body = handler.getBody();
   if (!Node.isBlock(body)) return scope;
 
-  // Walk all variable declarations in handler body
-  const decls = body.getDescendantsOfKind(SyntaxKind.VariableDeclaration);
+  // Walk variable declarations in *this* function body — skip nested callbacks
+  // so their locals don't shadow handler-scoped names.
+  const decls = collectOwnVariableDeclarations(body);
   for (const decl of decls) {
     bindDeclaration(decl, scope);
   }
 
   return scope;
+}
+
+function collectOwnVariableDeclarations(block: Block): VariableDeclaration[] {
+  const out: VariableDeclaration[] = [];
+  function visit(node: Node): void {
+    if (
+      Node.isArrowFunction(node) ||
+      Node.isFunctionExpression(node) ||
+      Node.isFunctionDeclaration(node)
+    ) {
+      return;
+    }
+    if (Node.isVariableDeclaration(node)) out.push(node);
+    node.forEachChild(visit);
+  }
+  block.forEachChild(visit);
+  return out;
 }
 
 function bindDeclaration(decl: VariableDeclaration, scope: Scope): void {
@@ -145,6 +164,21 @@ function inferOrigin(expr: Expression, scope: Scope): VarOrigin {
     const v = scope.vars.get(expr.getText());
     if (v) return v.origin;
     return { kind: "unknown", expr: expr.getText() };
+  }
+
+  // args.X where X is v.id("T") in argsShape → idOf
+  if (Node.isPropertyAccessExpression(expr)) {
+    const recv = expr.getExpression();
+    if (
+      Node.isIdentifier(recv) &&
+      scope.argsParamName === recv.getText() &&
+      scope.argsShape
+    ) {
+      const fs = scope.argsShape.get(expr.getName());
+      if (fs && fs.shape.kind === "id") {
+        return { kind: "idOf", table: fs.shape.table };
+      }
+    }
   }
 
   // call chains: ctx.db.get(id) / ctx.db.query("T").<...>.first()/.unique()/.collect()/.paginate()
@@ -258,6 +292,11 @@ function inferTableFromIdArg(arg: Node, scope: Scope): string | null {
       if (fs && fs.shape.kind === "id") return fs.shape.table;
     }
   }
+  // case: `id` where `const id = args.foo` was bound earlier
+  if (Node.isIdentifier(arg)) {
+    const v = scope.vars.get(arg.getText());
+    if (v && v.origin.kind === "idOf") return v.origin.table;
+  }
   return null;
 }
 
@@ -300,6 +339,8 @@ function describeOrigin(o: VarOrigin): string {
       return `paginated<${o.table}>`;
     case "literal":
       return "literal";
+    case "idOf":
+      return `id<${o.table}>`;
     case "param":
       return "param";
     default:
@@ -363,6 +404,10 @@ function classifyExpression(expr: Expression | Block, scope: Scope): ReturnInten
 
   // call (e.g. await ctx.db.get(id)): wrap as origin
   if (Node.isCallExpression(expr)) {
+    // Special: `arr.map(callback)` — trace callback body so we don't
+    // incorrectly inherit rows<T> when the callback transforms the row.
+    const mapped = tryClassifyMapCall(expr, scope);
+    if (mapped) return mapped;
     const origin = inferOrigin(expr, scope);
     return originToIntent(origin, new Set(), new Map());
   }
@@ -373,6 +418,55 @@ function classifyExpression(expr: Expression | Block, scope: Scope): ReturnInten
   }
 
   return { kind: "unanalyzed", reason: `unsupported return expr: ${expr.getKindName()}` };
+}
+
+/**
+ * Handle `<arr>.map(arrowFn)` directly — recurse into the callback body and
+ * wrap as `literalArray`. Returns null if `call` isn't a `.map` call.
+ */
+function tryClassifyMapCall(call: CallExpression, scope: Scope): ReturnIntent | null {
+  const expr = call.getExpression();
+  if (!Node.isPropertyAccessExpression(expr) || expr.getName() !== "map") return null;
+  const arg = call.getArguments()[0];
+  if (!arg) return null;
+  if (!Node.isArrowFunction(arg) && !Node.isFunctionExpression(arg)) return null;
+
+  // Build sub-scope: bind callback param to row<T> if receiver is rows<T>.
+  const subScope: Scope = {
+    vars: new Map(scope.vars),
+    argsShape: scope.argsShape,
+    argsParamName: scope.argsParamName,
+  };
+  const receiverOrigin = inferOrigin(expr.getExpression(), scope);
+  const params = arg.getParameters();
+  if (params[0]) {
+    const elementOrigin = elementOriginOf(receiverOrigin);
+    if (elementOrigin) {
+      const nameNode = params[0].getNameNode();
+      if (Node.isIdentifier(nameNode)) {
+        subScope.vars.set(nameNode.getText(), { origin: elementOrigin });
+      }
+    }
+  }
+
+  const body = arg.getBody();
+  let elementIntent: ReturnIntent;
+  if (Node.isBlock(body)) {
+    const rets = collectReturnStatements(body);
+    const first = rets[0]?.getExpression();
+    if (!first) return null;
+    elementIntent = classifyExpression(first, subScope);
+  } else {
+    elementIntent = classifyExpression(body as Expression, subScope);
+  }
+
+  return { kind: "literalArray", element: elementIntent };
+}
+
+function elementOriginOf(o: VarOrigin): VarOrigin | null {
+  if (o.kind === "rowsOf") return { kind: "rowOf", table: o.table, nullable: false };
+  if (o.kind === "paginatedOf") return { kind: "rowOf", table: o.table, nullable: false };
+  return null;
 }
 
 function classifyVar(name: string, scope: Scope): ReturnIntent {
@@ -395,6 +489,8 @@ function originToIntent(
       return { kind: "paginated", table: origin.table, drop, add };
     case "literal":
       return { kind: "literal", fields: origin.fields };
+    case "idOf":
+      return { kind: "unanalyzed", reason: `returning bare id<${origin.table}>` };
     case "param":
       return { kind: "unanalyzed", reason: "returning a parameter" };
     default:
@@ -424,7 +520,9 @@ function classifyObjectLiteral(obj: ObjectLiteralExpression, scope: Scope): Retu
       baseOrigin = origin;
     } else if (Node.isPropertyAssignment(prop)) {
       const name = propAssignName(prop);
-      if (name) literalFieldsMap.set(name, { kind: "any" });
+      if (!name) continue;
+      const init = prop.getInitializer();
+      literalFieldsMap.set(name, init ? literalShapeOf(init) : { kind: "any" });
     } else if (Node.isShorthandPropertyAssignment(prop)) {
       literalFieldsMap.set(prop.getName(), { kind: "any" });
     }
@@ -438,8 +536,44 @@ function classifyObjectLiteral(obj: ObjectLiteralExpression, scope: Scope): Retu
   return { kind: "literal", fields: literalFieldsMap };
 }
 
+/**
+ * Best-effort: read a literal value from an initializer expression.
+ * Used to capture discriminator values like `ok: true as const` so the
+ * matcher can score-match union branches.
+ */
+function literalShapeOf(node: Node): Shape {
+  let n: Node = node;
+  // unwrap `<expr> as const` and `<expr> as T`
+  while (Node.isAsExpression(n) || Node.isTypeAssertion(n)) {
+    n = n.getExpression();
+  }
+  if (Node.isStringLiteral(n)) return { kind: "literal", value: n.getLiteralValue() };
+  if (Node.isNumericLiteral(n)) return { kind: "literal", value: Number(n.getLiteralValue()) };
+  if (n.getKind() === SyntaxKind.TrueKeyword) return { kind: "literal", value: true };
+  if (n.getKind() === SyntaxKind.FalseKeyword) return { kind: "literal", value: false };
+  return { kind: "any" };
+}
+
 function collectReturnStatements(block: Block): ReturnStatement[] {
-  return block.getDescendantsOfKind(SyntaxKind.ReturnStatement);
+  // Only collect returns belonging to *this* function — never descend into
+  // nested arrow / function expressions / function declarations, since their
+  // returns belong to those callbacks, not to the handler.
+  const out: ReturnStatement[] = [];
+  function visit(node: Node): void {
+    if (
+      Node.isArrowFunction(node) ||
+      Node.isFunctionExpression(node) ||
+      Node.isFunctionDeclaration(node)
+    ) {
+      return;
+    }
+    if (Node.isReturnStatement(node)) {
+      out.push(node);
+    }
+    node.forEachChild(visit);
+  }
+  block.forEachChild(visit);
+  return out;
 }
 
 function dedupeIntents(intents: ReturnIntent[]): ReturnIntent[] {

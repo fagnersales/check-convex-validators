@@ -34,6 +34,8 @@ function matchIntentAgainstUnion(
   branches: Shape[],
   schema: SchemaModel,
 ): Issue[] {
+  // v.any() accepts anything — no diff to compute.
+  if (branches.some((b) => b.kind === "any")) return [];
   switch (intent.kind) {
     case "unanalyzed":
       return [
@@ -180,19 +182,23 @@ function matchIntentAgainstUnion(
           },
         ];
       }
+      // Outer drops/adds describe the paginated container (page/isDone/cursor),
+      // not the per-row shape. Don't propagate them to the row synthetic.
       const synthetic: ReturnIntent = {
         kind: "row",
         table: intent.table,
-        drop: intent.drop,
-        add: intent.add,
+        drop: new Set(),
+        add: new Map(),
         nullable: false,
       };
       return diffRowAgainstObject(fn, synthetic, page.shape.element, schema);
     }
 
     case "literal": {
-      const objBranch = branches.find((b) => b.kind === "object");
-      if (!objBranch || objBranch.kind !== "object") {
+      const objBranches = branches.filter(
+        (b): b is Shape & { kind: "object" } => b.kind === "object",
+      );
+      if (objBranches.length === 0) {
         return [
           {
             severity: "warn",
@@ -204,7 +210,9 @@ function matchIntentAgainstUnion(
           },
         ];
       }
-      return diffLiteralAgainstObject(fn, intent.fields, objBranch);
+      // Score each branch by literal-discriminator agreement + field overlap.
+      const best = pickBestBranchForLiteral(intent.fields, objBranches);
+      return diffLiteralAgainstObject(fn, intent.fields, best);
     }
 
     case "literalArray": {
@@ -268,11 +276,15 @@ function diffRowAgainstObject(
   }
 
   const validatorFields = validatorObj.fields;
+  const hasUnresolvedSpread = [...validatorFields.keys()].some((k) =>
+    k.startsWith("__spread:"),
+  );
 
   // R1: missing in validator
   for (const [k, v] of expectedAfterDrop) {
     if (k.startsWith("__spread:")) continue;
     if (!validatorFields.has(k)) {
+      if (hasUnresolvedSpread) continue; // spread might cover this field
       // optional fields *can* be omitted from validator only if validator never receives them
       // but Convex stores them on the row → still error. So flag.
       issues.push({
@@ -307,6 +319,7 @@ function diffRowAgainstObject(
 
   // R2: stale fields in validator (skip extras the handler explicitly adds)
   for (const [k] of validatorFields) {
+    if (k.startsWith("__spread:")) continue; // synthetic, never user-facing
     if (expectedAfterDrop.has(k)) continue;
     if (intent.add.has(k)) continue;
     issues.push({
@@ -321,6 +334,37 @@ function diffRowAgainstObject(
   }
 
   return issues;
+}
+
+/**
+ * For union returns like `v.union(v.object({ok: literal(true), ...}),
+ * v.object({ok: literal(false), ...}))`, pick the branch whose literal-typed
+ * fields match the handler's literal values. Fall back to keyset overlap.
+ */
+function pickBestBranchForLiteral(
+  literalFields: Map<string, Shape>,
+  branches: (Shape & { kind: "object" })[],
+): Shape & { kind: "object" } {
+  let best = branches[0]!;
+  let bestScore = -Infinity;
+  for (const b of branches) {
+    let score = 0;
+    for (const [k, vf] of b.fields) {
+      const lit = literalFields.get(k);
+      if (vf.shape.kind === "literal") {
+        if (lit?.kind === "literal") {
+          if (lit.value === vf.shape.value) score += 100;
+          else score -= 100;
+        }
+      }
+      if (lit) score += 1;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = b;
+    }
+  }
+  return best;
 }
 
 function diffLiteralAgainstObject(
