@@ -45,7 +45,17 @@ export interface SchemaModel {
 export type ReturnIntent =
   | { kind: "row"; table: string; drop: Set<string>; add: Map<string, Shape>; nullable: boolean }
   | { kind: "rows"; table: string; drop: Set<string>; add: Map<string, Shape> }
-  | { kind: "paginated"; table: string; drop: Set<string>; add: Map<string, Shape> }
+  | {
+      kind: "paginated";
+      table: string;
+      drop: Set<string>;
+      add: Map<string, Shape>;
+      /** Set when handler explicitly overrides `page` with its own array
+       *  (e.g. `return { ...result, page: pageWithUrls }`). The matcher
+       *  validates this intent against the validator's `page.element`
+       *  instead of synthesizing a row<T> from the schema. */
+      pageOverride?: ReturnIntent;
+    }
   | { kind: "literal"; fields: Map<string, Shape> }
   | { kind: "literalArray"; element: ReturnIntent }
   | { kind: "null" }

@@ -242,3 +242,25 @@ describe("paginated (R7)", () => {
     expect(missing.message).toContain("secret");
   });
 });
+
+describe("paginated literal page override", () => {
+  test("clean — `{...result, page: literalArray}` matches validator's literal page element", () => {
+    const { issues } = go("paginated-literal-page");
+    const errors = issues.filter((i) => i.severity === "error");
+    expect(errors).toEqual([]);
+  });
+
+  test("no STALE_FIELD on validator-only fields like attachmentUrls", () => {
+    const { issues } = go("paginated-literal-page");
+    const stale = issues.filter((i) => i.code === "STALE_FIELD");
+    expect(stale).toEqual([]);
+  });
+});
+
+describe("optional add via `?.` chain", () => {
+  test("no OPTIONALITY_MISMATCH on add-only field with optional-chain initializer", () => {
+    const { issues } = go("optional-add");
+    const opt = issues.filter((i) => i.code === "OPTIONALITY_MISMATCH");
+    expect(opt).toEqual([]);
+  });
+});

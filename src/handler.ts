@@ -208,6 +208,15 @@ function inferOrigin(expr: Expression, scope: Scope): VarOrigin {
         return { kind: "idOf", table: fs.shape.table };
       }
     }
+    // <paginatedOf>.page → rowsOf<T>
+    // (Convex paginate() result has `.page: T[]`. Lets `result.page.filter(...)`
+    // and `result.page.map(...)` flow through cardinality tracking.)
+    if (Node.isIdentifier(recv) && expr.getName() === "page") {
+      const info = scope.vars.get(recv.getText());
+      if (info && info.origin.kind === "paginatedOf") {
+        return { kind: "rowsOf", table: info.origin.table };
+      }
+    }
   }
 
   // call chains: ctx.db.get(id) / ctx.db.query("T").<...>.first()/.unique()/.collect()/.paginate()
@@ -242,11 +251,27 @@ function originFromCall(call: CallExpression, scope: Scope): VarOrigin {
     const method = expr.getName();
     const receiver = expr.getExpression();
 
+    // Promise.all(<expr>) — recurse into <expr>'s origin.
+    if (
+      Node.isIdentifier(receiver) &&
+      receiver.getText() === "Promise" &&
+      method === "all"
+    ) {
+      const arg = call.getArguments()[0];
+      if (arg) return inferOrigin(arg as Expression, scope);
+      return { kind: "unknown", expr: call.getText().slice(0, 80) };
+    }
+
     // ctx.db.get(id) — rowOf table inferred from id arg
     if (method === "get" && receiverText(receiver) === "ctx.db") {
       const idArg = call.getArguments()[0];
       const table = idArg ? inferTableFromIdArg(idArg, scope) : null;
       return { kind: "rowOf", table: table ?? "<unknown>", nullable: true };
+    }
+
+    // .filter(...) / .slice(...) / .sort(...) — preserve receiver cardinality.
+    if (method === "filter" || method === "slice" || method === "sort") {
+      return inferOrigin(receiver, scope);
     }
 
     // ctx.db.query("T")...<terminal>
@@ -507,9 +532,22 @@ function tryClassifyMapCall(call: CallExpression, scope: Scope): ReturnIntent | 
   let elementIntent: ReturnIntent;
   if (Node.isBlock(body)) {
     const rets = collectReturnStatements(body);
-    const first = rets[0]?.getExpression();
-    if (!first) return null;
-    elementIntent = classifyExpression(first, subScope);
+    if (rets.length === 0) return null;
+    // Multiple returns — common pattern: `if (skip) return null; return {...}`
+    // followed by `.filter(non-null)`. Prefer the first non-null intent so we
+    // describe the array's "real" payload; fall back to null if all returns
+    // are null/undefined (rare, validator should declare v.null() then).
+    const intents: ReturnIntent[] = [];
+    for (const ret of rets) {
+      const expr = ret.getExpression();
+      if (!expr) continue;
+      for (const branch of expandConditionals(expr)) {
+        intents.push(classifyExpression(branch, subScope));
+      }
+    }
+    if (intents.length === 0) return null;
+    const nonNull = intents.find((i) => i.kind !== "null");
+    elementIntent = nonNull ?? intents[0]!;
   } else {
     elementIntent = classifyExpression(body as Expression, subScope);
   }
@@ -611,6 +649,10 @@ function classifyObjectLiteral(obj: ObjectLiteralExpression, scope: Scope): Retu
   let baseOrigin: VarOrigin | null = null;
   let baseDrop = new Set<string>();
   const literalFieldsMap = new Map<string, Shape>();
+  // Captured when handler explicitly assigns `page: <expr>` AND the spread
+  // base is paginated. The matcher uses this to validate against the
+  // validator's `page.element` rather than diffing the schema row.
+  let pageOverride: ReturnIntent | null = null;
 
   for (const prop of obj.getProperties()) {
     if (Node.isSpreadAssignment(prop)) {
@@ -630,13 +672,33 @@ function classifyObjectLiteral(obj: ObjectLiteralExpression, scope: Scope): Retu
       const name = propAssignName(prop);
       if (!name) continue;
       const init = prop.getInitializer();
-      literalFieldsMap.set(name, init ? literalShapeOf(init) : { kind: "any" });
+      if (name === "page" && init) {
+        pageOverride = classifyExpression(init as Expression, scope);
+      }
+      literalFieldsMap.set(name, init ? initShapeOf(init, scope) : { kind: "any" });
     } else if (Node.isShorthandPropertyAssignment(prop)) {
-      literalFieldsMap.set(prop.getName(), { kind: "any" });
+      const name = prop.getName();
+      if (name === "page") {
+        pageOverride = classifyVar(name, scope);
+      }
+      literalFieldsMap.set(name, { kind: "any" });
     }
   }
 
   if (baseOrigin) {
+    if (
+      baseOrigin.kind === "paginatedOf" &&
+      pageOverride &&
+      pageOverride.kind !== "unanalyzed"
+    ) {
+      return {
+        kind: "paginated",
+        table: baseOrigin.table,
+        drop: baseDrop,
+        add: literalFieldsMap,
+        pageOverride,
+      };
+    }
     return originToIntent(baseOrigin, baseDrop, literalFieldsMap);
   }
 
@@ -660,6 +722,42 @@ function literalShapeOf(node: Node): Shape {
   if (n.getKind() === SyntaxKind.TrueKeyword) return { kind: "literal", value: true };
   if (n.getKind() === SyntaxKind.FalseKeyword) return { kind: "literal", value: false };
   return { kind: "any" };
+}
+
+/**
+ * Capture the shape of an object-literal initializer for use in `intent.add`.
+ * Falls back to `literalShapeOf` for literals; otherwise detects optional
+ * chains (`a?.b`, `a?.b()`) and wraps as `optional<any>` so the matcher
+ * doesn't flag OPTIONALITY_MISMATCH against a correctly-optional validator
+ * field. Anything else returns `any`.
+ */
+function initShapeOf(node: Node, _scope: Scope): Shape {
+  const lit = literalShapeOf(node);
+  if (lit.kind === "literal") return lit;
+  if (hasOptionalChain(node)) return { kind: "optional", inner: { kind: "any" } };
+  return { kind: "any" };
+}
+
+function hasOptionalChain(node: Node): boolean {
+  let current: Node | undefined = node;
+  // unwrap top-level `as` / type assertion
+  while (current && (Node.isAsExpression(current) || Node.isTypeAssertion(current))) {
+    current = current.getExpression();
+  }
+  while (current) {
+    if (
+      Node.isPropertyAccessExpression(current) ||
+      Node.isCallExpression(current) ||
+      Node.isElementAccessExpression(current)
+    ) {
+      const q = (current.compilerNode as { questionDotToken?: unknown }).questionDotToken;
+      if (q) return true;
+      current = current.getExpression() as Node;
+      continue;
+    }
+    break;
+  }
+  return false;
 }
 
 function collectReturnStatements(block: Block): ReturnStatement[] {

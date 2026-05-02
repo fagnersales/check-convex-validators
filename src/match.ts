@@ -170,7 +170,7 @@ function matchIntentAgainstUnion(
         ];
       }
       const page = objBranch.fields.get("page");
-      if (!page || page.shape.kind !== "array" || page.shape.element.kind !== "object") {
+      if (!page || page.shape.kind !== "array") {
         return [
           {
             severity: "error",
@@ -178,7 +178,29 @@ function matchIntentAgainstUnion(
             filePath: fn.filePath,
             line: fn.returnsValidatorLine,
             function: fn.exportName,
-            message: `Paginated validator missing v.array(v.object(...)) under "page" key`,
+            message: `Paginated validator missing v.array(...) under "page" key`,
+          },
+        ];
+      }
+      // Handler explicitly assigned `page: <expr>` (e.g. `{...result, page: pageWithUrls}`).
+      // Validate the override intent against validator's page.element instead
+      // of synthesizing a row<T> from schema — the schema row shape doesn't
+      // describe the projected literal output.
+      if (intent.pageOverride) {
+        // Override intent describes the whole `page` value (typically a
+        // literalArray). Validator's `page` shape is an array. Match
+        // override against the array branch directly.
+        return matchIntentAgainstUnion(fn, intent.pageOverride, [page.shape], schema);
+      }
+      if (page.shape.element.kind !== "object") {
+        return [
+          {
+            severity: "error",
+            code: "CARDINALITY_MISMATCH",
+            filePath: fn.filePath,
+            line: fn.returnsValidatorLine,
+            function: fn.exportName,
+            message: `Paginated validator's "page" array element is not an object — cannot diff against schema row`,
           },
         ];
       }
@@ -320,9 +342,11 @@ function diffRowAgainstObject(
         }`,
       });
     } else {
-      // R3: optionality mismatch
+      // R3: optionality mismatch — skip for fields that come from handler
+      // additions (we can't reliably infer optionality from arbitrary add
+      // expressions like `someExpr?.foo`).
       const vf = validatorFields.get(k)!;
-      if (vf.optional !== v.optional) {
+      if (!intent.add.has(k) && vf.optional !== v.optional) {
         issues.push({
           severity: "error",
           code: "OPTIONALITY_MISMATCH",
