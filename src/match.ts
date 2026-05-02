@@ -275,8 +275,10 @@ function matchIntentAgainstUnion(
     }
 
     case "passthrough": {
-      // Handler returns the result of `ctx.runQuery(internal.x.y, ...)` —
-      // compare the called function's returns shape against the caller's.
+      // Handler returns a value whose shape we know directly (e.g. result of
+      // `ctx.runQuery(internal.x.y, ...)`, or `<rowOf<T>>.<field>` resolved
+      // via schema). Compare the inferred shape against what the validator
+      // declares.
       const callerShape: Shape =
         branches.length === 1 ? branches[0]! : { kind: "union", members: branches };
       const mismatch = compareShapes(intent.shape, callerShape);
@@ -288,7 +290,7 @@ function matchIntentAgainstUnion(
             filePath: fn.filePath,
             line: fn.returnsValidatorLine,
             function: fn.exportName,
-            message: `runQuery target ${intent.from} ${mismatch}`,
+            message: `Handler returns ${intent.from} — ${mismatch}`,
           },
         ];
       }
@@ -439,6 +441,15 @@ function compareShapes(expected: Shape, actual: Shape): string | null {
   if (expected.kind === "any" || actual.kind === "any") return null;
   if (expected.kind === "ref" || actual.kind === "ref") return null; // unresolved — give up
   if (expected.kind === "unknown" || actual.kind === "unknown") return null;
+
+  // Validator widens to a union (e.g. `v.union(v.id("T"), v.null())`) — the
+  // expected single-shape passes if any union member matches.
+  if (actual.kind === "union" && expected.kind !== "union") {
+    for (const am of actual.members) {
+      if (compareShapes(expected, am) === null) return null;
+    }
+    return `expected ${expected.kind}, no matching union member in validator`;
+  }
 
   if (expected.kind !== actual.kind) {
     return `expected ${expected.kind}, validator has ${actual.kind}`;

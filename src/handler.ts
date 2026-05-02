@@ -13,7 +13,7 @@ import {
   type ObjectBindingPattern,
 } from "ts-morph";
 import { parseValidator } from "./validator.ts";
-import type { ReturnIntent, Shape, FieldShape } from "./types.ts";
+import type { ReturnIntent, Shape, FieldShape, SchemaModel } from "./types.ts";
 
 /**
  * Extra context the scanner can pass: a map from arg name → field shape,
@@ -22,6 +22,9 @@ import type { ReturnIntent, Shape, FieldShape } from "./types.ts";
  */
 export interface AnalyzeContext {
   argsShape?: Map<string, FieldShape>;
+  /** Schema model — used to resolve `<rowOf<T>>.fieldName` to the field's
+   *  shape so `return charge._id` etc. classify correctly. */
+  schema?: SchemaModel;
   /**
    * Resolve `ctx.runQuery(internal.x.y, ...)` to the called function's
    * returns shape. Segments are the path after `internal`/`api` —
@@ -85,6 +88,7 @@ interface Scope {
   vars: Map<string, VarInfo>;
   argsShape?: Map<string, FieldShape>;
   argsParamName?: string;
+  schema?: SchemaModel;
   resolveRunCall?: (segments: string[]) => Shape | null;
 }
 
@@ -112,6 +116,7 @@ function buildScope(handler: HandlerFn, ctx: AnalyzeContext): Scope {
   const scope: Scope = {
     vars: new Map(),
     argsShape: ctx.argsShape,
+    schema: ctx.schema,
     resolveRunCall: ctx.resolveRunCall,
   };
 
@@ -557,6 +562,11 @@ function classifyExpression(expr: Expression | Block, scope: Scope): ReturnInten
     return classifyVar(expr.getText(), scope);
   }
 
+  // PropertyAccessExpression — `foo.bar` where foo is a known binding.
+  if (Node.isPropertyAccessExpression(expr)) {
+    return classifyPropertyAccess(expr, scope);
+  }
+
   // await
   if (Node.isAwaitExpression(expr)) {
     return classifyExpression(expr.getExpression(), scope);
@@ -604,6 +614,7 @@ function tryClassifyMapCall(call: CallExpression, scope: Scope): ReturnIntent | 
     vars: new Map(scope.vars),
     argsShape: scope.argsShape,
     argsParamName: scope.argsParamName,
+    schema: scope.schema,
     resolveRunCall: scope.resolveRunCall,
   };
   const receiverOrigin = inferOrigin(expr.getExpression(), scope);
@@ -707,6 +718,59 @@ function classifyVar(name: string, scope: Scope): ReturnIntent {
   const info = scope.vars.get(name);
   if (!info) return { kind: "unanalyzed", reason: `unknown identifier ${name}` };
   return originToIntent(info.origin, info.drop ?? new Set(), new Map());
+}
+
+/**
+ * Classify `<recv>.<field>` against scope. The common cases:
+ *   - `row._id` / `row._creationTime` (system fields)
+ *   - `row.<schemaField>` — resolves to the field's shape via schema lookup
+ *   - `args.<idField>` — already handled in inferOrigin's idOf path; here we
+ *     surface it as `idValue<T>` for direct returns.
+ */
+function classifyPropertyAccess(
+  expr: import("ts-morph").PropertyAccessExpression,
+  scope: Scope,
+): ReturnIntent {
+  const recv = expr.getExpression();
+  const fieldName = expr.getName();
+
+  // args.<idField> → idValue (caller might `return args.id`).
+  if (
+    Node.isIdentifier(recv) &&
+    scope.argsParamName === recv.getText() &&
+    scope.argsShape
+  ) {
+    const fs = scope.argsShape.get(fieldName);
+    if (fs && fs.shape.kind === "id") {
+      return { kind: "idValue", table: fs.shape.table };
+    }
+    if (fs) {
+      return { kind: "passthrough", shape: fs.shape, from: `args.${fieldName}` };
+    }
+  }
+
+  // <rowOf<T>>.<field>
+  if (Node.isIdentifier(recv)) {
+    const info = scope.vars.get(recv.getText());
+    if (info?.origin.kind === "rowOf") {
+      const table = info.origin.table;
+      if (fieldName === "_id") return { kind: "idValue", table };
+      if (fieldName === "_creationTime") {
+        return { kind: "primitive", primitive: "number" };
+      }
+      const tbl = scope.schema?.tables.get(table);
+      const fs = tbl?.fields.get(fieldName);
+      if (fs) {
+        return { kind: "passthrough", shape: fs.shape, from: `${table}.${fieldName}` };
+      }
+    }
+    if (info?.origin.kind === "literal") {
+      const s = info.origin.fields.get(fieldName);
+      if (s) return { kind: "passthrough", shape: s, from: `<literal>.${fieldName}` };
+    }
+  }
+
+  return { kind: "unanalyzed", reason: `unsupported return expr: PropertyAccessExpression` };
 }
 
 function originToIntent(

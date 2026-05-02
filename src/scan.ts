@@ -90,6 +90,7 @@ export function run(opts: RunOptions): RunResult {
     }
     const intents = analyzeHandler(p.handlerNode, {
       argsShape: p.argsShape,
+      schema,
       resolveRunCall,
     });
     const fn: FunctionInfo = {
