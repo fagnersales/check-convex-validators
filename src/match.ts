@@ -314,6 +314,19 @@ function diffRowAgainstObject(
           }, validator=${vf.optional ? "optional" : "required"}`,
         });
       }
+      // R4: recursive shape compare
+      const mismatch = compareShapes(v.shape, vf.shape);
+      if (mismatch) {
+        issues.push({
+          severity: "error",
+          code: "TYPE_MISMATCH",
+          filePath: fn.filePath,
+          line: fn.returnsValidatorLine,
+          function: fn.exportName,
+          table: intent.table,
+          message: `Field "${k}" type mismatch: ${mismatch}`,
+        });
+      }
     }
   }
 
@@ -334,6 +347,96 @@ function diffRowAgainstObject(
   }
 
   return issues;
+}
+
+/**
+ * Recursively compare a schema-derived shape (`expected`) against the
+ * validator-declared shape (`actual`). Returns null if compatible, or a short
+ * human-readable description of the first incompatibility found.
+ *
+ * Compatibility rules:
+ *  - `any` on either side: matches anything.
+ *  - kinds must agree (after unwrapping `optional`).
+ *  - `id<T>`: table names must agree.
+ *  - `literal`: values must agree.
+ *  - `array`: recurse on element.
+ *  - `record`: recurse on key + value.
+ *  - `union`: every member of `expected` must be coverable by some member of
+ *    `actual` (so the validator is at least as permissive).
+ *  - `object`: skip — handled at field-level by diffRowAgainstObject.
+ */
+function compareShapes(expected: Shape, actual: Shape): string | null {
+  if (expected.kind === "optional") {
+    const inner = actual.kind === "optional" ? actual.inner : actual;
+    return compareShapes(expected.inner, inner);
+  }
+  if (actual.kind === "optional") {
+    return compareShapes(expected, actual.inner);
+  }
+  if (expected.kind === "any" || actual.kind === "any") return null;
+  if (expected.kind === "ref" || actual.kind === "ref") return null; // unresolved — give up
+  if (expected.kind === "unknown" || actual.kind === "unknown") return null;
+
+  if (expected.kind !== actual.kind) {
+    return `expected ${expected.kind}, validator has ${actual.kind}`;
+  }
+
+  switch (expected.kind) {
+    case "id": {
+      const a = actual as Extract<Shape, { kind: "id" }>;
+      if (expected.table !== a.table) {
+        return `id table mismatch: schema id<${expected.table}>, validator id<${a.table}>`;
+      }
+      return null;
+    }
+    case "literal": {
+      const a = actual as Extract<Shape, { kind: "literal" }>;
+      if (expected.value !== a.value) {
+        return `literal mismatch: schema ${JSON.stringify(expected.value)}, validator ${JSON.stringify(a.value)}`;
+      }
+      return null;
+    }
+    case "array": {
+      const a = actual as Extract<Shape, { kind: "array" }>;
+      const inner = compareShapes(expected.element, a.element);
+      return inner ? `array element ${inner}` : null;
+    }
+    case "record": {
+      const a = actual as Extract<Shape, { kind: "record" }>;
+      const km = compareShapes(expected.key, a.key);
+      if (km) return `record key ${km}`;
+      const vm = compareShapes(expected.value, a.value);
+      return vm ? `record value ${vm}` : null;
+    }
+    case "union": {
+      const a = actual as Extract<Shape, { kind: "union" }>;
+      for (const em of expected.members) {
+        const ok = a.members.some((am) => compareShapes(em, am) === null);
+        if (!ok) {
+          return `validator union missing member ${shapeBrief(em)}`;
+        }
+      }
+      return null;
+    }
+    case "object":
+      // Field-level compare happens elsewhere; structural mismatch already covered.
+      return null;
+    default:
+      return null;
+  }
+}
+
+function shapeBrief(s: Shape): string {
+  switch (s.kind) {
+    case "literal":
+      return JSON.stringify(s.value);
+    case "id":
+      return `id<${s.table}>`;
+    case "array":
+      return `${shapeBrief(s.element)}[]`;
+    default:
+      return s.kind;
+  }
 }
 
 /**

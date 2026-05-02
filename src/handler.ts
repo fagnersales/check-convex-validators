@@ -52,10 +52,26 @@ export function analyzeHandler(handler: HandlerFn, ctx: AnalyzeContext = {}): Re
       intents.push({ kind: "unanalyzed", reason: "bare `return` (undefined)" });
       continue;
     }
-    intents.push(classifyExpression(expr, scope));
+    for (const branch of expandConditionals(expr)) {
+      intents.push(classifyExpression(branch, scope));
+    }
   }
 
   return dedupeIntents(intents);
+}
+
+/**
+ * Expand top-level ternaries into one expression per branch. Recurses so
+ * that `a ? b : (c ? d : e)` yields `[b, d, e]`.
+ */
+function expandConditionals(expr: Expression): Expression[] {
+  if (Node.isConditionalExpression(expr)) {
+    return [
+      ...expandConditionals(expr.getWhenTrue() as Expression),
+      ...expandConditionals(expr.getWhenFalse() as Expression),
+    ];
+  }
+  return [expr];
 }
 
 interface Scope {
@@ -75,6 +91,7 @@ type VarOrigin =
   | { kind: "rowsOf"; table: string }
   | { kind: "paginatedOf"; table: string }
   | { kind: "literal"; fields: Map<string, Shape> }
+  | { kind: "literalArrayOf"; element: ReturnIntent }
   | { kind: "idOf"; table: string }
   | { kind: "param" }
   | { kind: "unknown"; expr: string };
@@ -235,11 +252,17 @@ function originFromCall(call: CallExpression, scope: Scope): VarOrigin {
       }
     }
 
-    // .map(...) on rows or paginated.page
+    // .map(...) — trace the callback body so we don't incorrectly inherit
+    // rows<T> when the callback transforms the row shape.
     if (method === "map") {
-      const recvOrigin = inferOrigin(receiver, scope);
-      // map preserves cardinality
-      return recvOrigin;
+      const mapped = tryClassifyMapCall(call, scope);
+      if (mapped && mapped.kind === "literalArray") {
+        return { kind: "literalArrayOf", element: mapped.element };
+      }
+      // Fallback: if the callback didn't classify (e.g. inline lambda body
+      // we can't follow), preserve receiver's cardinality so downstream
+      // code at least knows it's an array.
+      return inferOrigin(receiver, scope);
     }
 
     // ctx.db.normalizeId / .system.* / etc — give up
@@ -339,6 +362,8 @@ function describeOrigin(o: VarOrigin): string {
       return `paginated<${o.table}>`;
     case "literal":
       return "literal";
+    case "literalArrayOf":
+      return "literalArray";
     case "idOf":
       return `id<${o.table}>`;
     case "param":
@@ -489,6 +514,8 @@ function originToIntent(
       return { kind: "paginated", table: origin.table, drop, add };
     case "literal":
       return { kind: "literal", fields: origin.fields };
+    case "literalArrayOf":
+      return { kind: "literalArray", element: origin.element };
     case "idOf":
       return { kind: "unanalyzed", reason: `returning bare id<${origin.table}>` };
     case "param":

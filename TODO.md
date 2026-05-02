@@ -9,14 +9,14 @@ Roadmap for `check-convex-validators`. Each rule maps to a class of `ReturnsVali
 | R1 | Missing schema field in row-return validator | ✅ | Original drift bug. |
 | R2 | Stale field in validator (not on schema) | ✅ | warn-only — could be join. |
 | R3 | Optionality mismatch (required vs optional) | ✅ | |
-| R4 | Type mismatch (e.g. schema `v.string()`, validator `v.literal("x")`) | ❌ | Currently only checks presence/optionality. Needs recursive structural compare. |
+| R4 | Type mismatch (e.g. schema `v.string()`, validator `v.literal("x")`) | ✅ | Recursive `compareShapes` covers primitives, `id<T>`, literals, arrays, records, and union member coverage. |
 | R5 | Null branch missing (`return null` not in `v.union(... v.null())`) | ✅ | |
 | R6 | Cardinality (array vs single) | ✅ | |
 | R7 | Paginated shape (`{ page, isDone, continueCursor }`) | ✅ | |
 | R8 | Object literal missing/extra fields vs validator | ✅ | |
 | R9 | `return { ...row, extra }` — schema(T) ∪ extras | ✅ | |
 | R10 | `const { drop, ...rest } = row; return rest` | ✅ | Single-level destructure only. Nested rest patterns not supported. |
-| R11 | Array `.map(d => ({ ...d, x }))` | 🚧 | Direct return of `.map(c => ({...}))` is classified as `literalArray` correctly. Spread `{ ...c, extra }` inside the callback is preserved. Bound `.map` results (`const x = arr.map(...)`) aren't fully traced — falls back to receiver origin which can be wrong; the .map's closure body isn't recursed into when the result is bound. |
+| R11 | Array `.map(d => ({ ...d, x }))` | ✅ | Direct + bound forms classified as `literalArray` via callback-body trace. Spread `{ ...c, extra }` inherits row origin with adds. |
 | R12 | Imported validators (`returns: companyReturnValidator`) | ✅ | Local-file + relative imports + barrel re-exports (`export { x } from "./y"`). No node_modules / package imports. |
 | R13 | Union return matched to handler branches by `_id` table | ✅ | |
 | R14 | Discriminated union with multiple object branches | ✅ | Score-matches each handler literal to the branch whose literal-typed fields agree (e.g. `ok: true as const` → branch with `ok: v.literal(true)`). Falls back to keyset overlap. |
@@ -28,8 +28,7 @@ Roadmap for `check-convex-validators`. Each rule maps to a class of `ReturnsVali
 - **Args resolved in middleware:** `customQuery` / `customMutation` (convex-helpers) wrap the function. Args are typed in a different builder. Not yet recognized.
 - **`ctx.runQuery` / `ctx.runMutation`:** When a handler returns the result of an internal call, we mark it `unanalyzed`. Could resolve the called function's `returns` shape and propagate.
 - **`Promise.all([...])`:** array of awaited rows. `.map(...)` chained. Trace through.
-- **Conditional return paths:** ternary trace currently follows the `whenTrue` branch only. Need both branches → emit one intent per branch.
-- **Bound `.map` transforms:** `const x = arr.map(...); return x;` — direct returns of `.map` are traced (R11), but when bound to a variable the result still inherits `rowsOf<T>` from the receiver. Should classify as `literalArray` based on callback body. (Resolved)
+- **Conditional return paths:** ternary trace now expands both branches at the return-statement level. Nested conditionals inside non-return positions still pick `whenTrue` only (rare).
 
 ## Bugs to fix
 
@@ -63,10 +62,12 @@ Roadmap for `check-convex-validators`. Each rule maps to a class of `ReturnsVali
 - [x] `const-binding` — `const id = args.x; ctx.db.get(id)`.
 - [x] `nested-returns` — inner `.map(c => { return ... })` return doesn't leak.
 - [x] `map-transform` — direct return of `.map(c => ({...}))` (R11).
+- [x] `map-bound` — bound `.map` result (R11 bound case).
 - [x] `discriminated-union` — `{ ok: true } | { ok: false, error }` discriminator scoring (R14).
+- [x] `type-mismatch` — primitive / id-table / array-element / union-member-coverage (R4).
+- [x] `ternary` — `cond ? a : b` whenFalse branch checked.
 - [ ] `runQuery` indirection.
 - [ ] Custom builder (`customQuery` from convex-helpers).
-- [ ] Conditional ternary returning row vs null.
 
 ## Maintenance
 

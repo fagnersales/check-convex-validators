@@ -123,9 +123,52 @@ describe("validator spread (...x.fields)", () => {
   });
 });
 
+describe("conditional ternary — both branches", () => {
+  test("flags whenFalse branch's missing field even when whenTrue is clean", () => {
+    const { issues } = go("ternary");
+    const missing = issues.filter((i) => i.code === "MISSING_LITERAL_FIELD");
+    expect(missing.some((i) => i.message.includes("value"))).toBe(true);
+  });
+});
+
+describe("type mismatch — recursive (R4)", () => {
+  test("flags primitive kind mismatch (string vs number)", () => {
+    const { issues } = go("type-mismatch");
+    const tm = issues.filter((i) => i.code === "TYPE_MISMATCH");
+    const names = tm.map((i) => i.message);
+    expect(names.some((m) => m.includes("name"))).toBe(true);
+  });
+
+  test("flags id table mismatch (id<users> vs id<stores>)", () => {
+    const { issues } = go("type-mismatch");
+    const tm = issues.filter((i) => i.code === "TYPE_MISMATCH");
+    expect(tm.some((i) => i.message.includes("ownerId"))).toBe(true);
+  });
+
+  test("flags array element type mismatch", () => {
+    const { issues } = go("type-mismatch");
+    const tm = issues.filter((i) => i.code === "TYPE_MISMATCH");
+    expect(tm.some((i) => i.message.includes("tags"))).toBe(true);
+  });
+
+  test("flags union missing-member coverage", () => {
+    const { issues } = go("type-mismatch");
+    const tm = issues.filter((i) => i.code === "TYPE_MISMATCH");
+    expect(tm.some((i) => i.message.includes("status"))).toBe(true);
+  });
+});
+
 describe("discriminated union (R14)", () => {
   test("matches each literal return to the branch whose literal discriminator agrees", () => {
     const { issues } = go("discriminated-union");
+    const errors = issues.filter((i) => i.severity === "error");
+    expect(errors).toEqual([]);
+  });
+});
+
+describe(".map(c => ({...})) bound to const (R11 bound)", () => {
+  test("bound .map result is classified as literalArray, not rows<T>", () => {
+    const { issues } = go("map-bound");
     const errors = issues.filter((i) => i.severity === "error");
     expect(errors).toEqual([]);
   });
