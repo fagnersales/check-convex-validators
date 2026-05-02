@@ -43,8 +43,18 @@ Roadmap for `check-convex-validators`. Each rule maps to a class of `ReturnsVali
 - [x] `v.any()` validator branch short-circuits the matcher — no false NULL_BRANCH/etc.
 - [x] `v.object(<identifier>)` resolves the identifier to its const definition (was emitting TYPE_MISMATCH).
 - [x] Paginated synthetic no longer inherits outer `drop`/`add` set (was emitting bogus MISSING_FIELD on `page`).
+- [x] Paginated literal-page override: `return { ...result, page: literalArray }` matches against validator's `page` element instead of synthesizing schema row.
+- [x] Optional-chain adds: `cancelledByEmail: someUser?.email` no longer fires bogus OPTIONALITY_MISMATCH.
+- [x] Multi-return `.map` callbacks (`if (skip) return null; return {...}` filtered later) prefer non-null intent — no spurious NULL_BRANCH_MISSING.
+- [x] `result.page.filter(...)` / `.sort(...)` / `.slice(...)` propagate cardinality.
+- [x] `Promise.all(...)` in `inferOrigin` — `const x = await Promise.all(...)` const-bindings carry the inner array origin.
+- [x] Non-null assertion `foo!` unwraps to inner expression.
+- [x] `ctx.db.insert("T", ...)` classified as `idValue<T>` and matched against `v.id("T")`.
+- [x] `ctx.storage.generateUploadUrl()` / `ctx.storage.getUrl()` / `JSON.stringify(...)` classified as primitive `string`.
+- [x] Const-bound array / primitive literals (`const arr = []`, `const x = 0`) carry their origin instead of falling to unknown.
 - [ ] `ctx.db.get(someId)` where `someId` came from another row's `.someId: v.id("T")` field. Could trace via schema lookup.
 - [ ] Nested `defineTable(v.object({...}))` — some Convex projects wrap the field map in `v.object(...)` explicitly. Schema parser handles bare object literal but not the wrapped form.
+- [ ] `return foo.bar` where `foo` is a row binding and `bar` is a known schema field — classify as the field's primitive shape (~50 unanalyzed in spokpay).
 
 ## Nice-to-have
 
@@ -68,7 +78,13 @@ Roadmap for `check-convex-validators`. Each rule maps to a class of `ReturnsVali
 - [x] `ternary` — `cond ? a : b` whenFalse branch checked.
 - [x] `runQuery` indirection.
 - [x] `Promise.all(arr.map(...))`.
-- [ ] Custom builder (`customQuery` from convex-helpers).
+- [x] `paginated-literal-page` — `{...result, page: literalArray}` with literal validator.
+- [x] `optional-add` — `someExpr?.email` add against optional validator field.
+- [x] `insert-id` — `ctx.db.insert("T", ...)` matches `v.id("T")`, mismatches `v.id("U")`.
+- [x] `empty-array` — `return []` early-exit doesn't trip cardinality check.
+- [x] `non-null-assert` — `return foo!` unwraps to detect underlying drift.
+- [x] `storage-url` — `ctx.storage.generateUploadUrl()` and `JSON.stringify(...)` as string.
+- [ ] Custom builder (`customQuery` from convex-helpers) used at the call site (when needed).
 
 ## Maintenance
 

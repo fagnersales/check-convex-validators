@@ -256,6 +256,24 @@ function matchIntentAgainstUnion(
       return matchIntentAgainstUnion(fn, intent.element, innerBranches, schema);
     }
 
+    case "idValue": {
+      // ctx.db.insert("T", ...) — validator must accept id<T>.
+      const ok = branches.some(
+        (b) => b.kind === "id" && b.table === intent.table,
+      );
+      if (ok) return [];
+      return [
+        {
+          severity: "error",
+          code: "TYPE_MISMATCH",
+          filePath: fn.filePath,
+          line: fn.returnsValidatorLine,
+          function: fn.exportName,
+          message: `Handler returns id<${intent.table}> (ctx.db.insert) but validator has no matching v.id("${intent.table}")`,
+        },
+      ];
+    }
+
     case "passthrough": {
       // Handler returns the result of `ctx.runQuery(internal.x.y, ...)` —
       // compare the called function's returns shape against the caller's.

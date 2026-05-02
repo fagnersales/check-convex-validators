@@ -264,3 +264,64 @@ describe("optional add via `?.` chain", () => {
     expect(opt).toEqual([]);
   });
 });
+
+describe("ctx.db.insert as id<T>", () => {
+  test("flags id table mismatch when validator declares wrong table", () => {
+    const { issues } = go("insert-id");
+    const tm = issues.filter(
+      (i) => i.code === "TYPE_MISMATCH" && i.function === "createPost",
+    );
+    expect(tm.length).toBeGreaterThan(0);
+  });
+
+  test("clean when validator's id table matches insert table", () => {
+    const { issues } = go("insert-id");
+    const errs = issues.filter(
+      (i) => i.severity === "error" && i.function === "createPostOk",
+    );
+    expect(errs).toEqual([]);
+  });
+});
+
+describe("empty array literal", () => {
+  test("clean — `return []` matches v.array(...)", () => {
+    const { issues } = go("empty-array");
+    const errors = issues.filter((i) => i.severity === "error");
+    expect(errors).toEqual([]);
+  });
+});
+
+describe("non-null assertion (foo!)", () => {
+  test("unwraps NonNullExpression to detect drift in underlying row", () => {
+    const { codes, issues } = go("non-null-assert");
+    expect(codes).toContain("MISSING_FIELD");
+    const missing = issues.find((i) => i.code === "MISSING_FIELD")!;
+    expect(missing.message).toContain("secret");
+  });
+});
+
+describe("ctx.storage.generateUploadUrl + JSON.stringify", () => {
+  test("flags TYPE_MISMATCH when validator wrong type for upload url string", () => {
+    const { issues } = go("storage-url");
+    const tm = issues.filter(
+      (i) => i.code === "TYPE_MISMATCH" && i.function === "badUploadUrl",
+    );
+    expect(tm.length).toBeGreaterThan(0);
+  });
+
+  test("clean when validator agrees that upload url is a string", () => {
+    const { issues } = go("storage-url");
+    const errs = issues.filter(
+      (i) => i.severity === "error" && i.function === "goodUploadUrl",
+    );
+    expect(errs).toEqual([]);
+  });
+
+  test("flags JSON.stringify return as string", () => {
+    const { issues } = go("storage-url");
+    const tm = issues.filter(
+      (i) => i.code === "TYPE_MISMATCH" && i.function === "badJson",
+    );
+    expect(tm.length).toBeGreaterThan(0);
+  });
+});

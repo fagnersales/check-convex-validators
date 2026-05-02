@@ -101,6 +101,10 @@ type VarOrigin =
   | { kind: "literal"; fields: Map<string, Shape> }
   | { kind: "literalArrayOf"; element: ReturnIntent }
   | { kind: "idOf"; table: string }
+  /** Value-of-id — ctx.db.insert("T", ...) returns Id<"T">. */
+  | { kind: "idValueOf"; table: string }
+  /** Primitive string/number/boolean from a recognised producer. */
+  | { kind: "primitive"; primitive: "string" | "number" | "boolean" }
   | { kind: "param" }
   | { kind: "unknown"; expr: string };
 
@@ -183,9 +187,45 @@ function bindDeclaration(decl: VariableDeclaration, scope: Scope): void {
 }
 
 function inferOrigin(expr: Expression, scope: Scope): VarOrigin {
-  // unwrap await
+  // unwrap await / parens / type assertions / non-null
   if (Node.isAwaitExpression(expr)) {
     return inferOrigin(expr.getExpression(), scope);
+  }
+  if (Node.isParenthesizedExpression(expr)) {
+    return inferOrigin(expr.getExpression(), scope);
+  }
+  if (Node.isAsExpression(expr) || Node.isTypeAssertion(expr)) {
+    return inferOrigin(expr.getExpression(), scope);
+  }
+  if (Node.isNonNullExpression(expr)) {
+    const inner = inferOrigin(expr.getExpression(), scope);
+    if (inner.kind === "rowOf") return { ...inner, nullable: false };
+    return inner;
+  }
+
+  // primitive literals — `const x = 0`, `const s = "hello"`, etc.
+  if (Node.isStringLiteral(expr)) return { kind: "primitive", primitive: "string" };
+  if (Node.isNumericLiteral(expr)) return { kind: "primitive", primitive: "number" };
+  if (
+    expr.getKind() === SyntaxKind.TrueKeyword ||
+    expr.getKind() === SyntaxKind.FalseKeyword
+  ) {
+    return { kind: "primitive", primitive: "boolean" };
+  }
+
+  // array literal — `const arr = []` or `const arr = [...]`
+  if (Node.isArrayLiteralExpression(expr)) {
+    const first = expr.getElements()[0];
+    if (!first) {
+      return {
+        kind: "literalArrayOf",
+        element: { kind: "unanalyzed", reason: "empty array element" },
+      };
+    }
+    return {
+      kind: "literalArrayOf",
+      element: classifyExpression(first as Expression, scope),
+    };
   }
 
   // identifier reference — look up in scope
@@ -267,6 +307,36 @@ function originFromCall(call: CallExpression, scope: Scope): VarOrigin {
       const idArg = call.getArguments()[0];
       const table = idArg ? inferTableFromIdArg(idArg, scope) : null;
       return { kind: "rowOf", table: table ?? "<unknown>", nullable: true };
+    }
+
+    // ctx.db.insert("T", ...) → idValue<T>
+    if (method === "insert" && receiverText(receiver) === "ctx.db") {
+      const tableArg = call.getArguments()[0];
+      if (tableArg && Node.isStringLiteral(tableArg)) {
+        return { kind: "idValueOf", table: tableArg.getLiteralValue() };
+      }
+    }
+
+    // ctx.storage.generateUploadUrl() → string
+    if (
+      method === "generateUploadUrl" &&
+      receiverText(receiver) === "ctx.storage"
+    ) {
+      return { kind: "primitive", primitive: "string" };
+    }
+    // ctx.storage.getUrl(id) → string | null (we surface as string for now;
+    // matcher's null branch isn't checked unless caller awaits direct).
+    if (method === "getUrl" && receiverText(receiver) === "ctx.storage") {
+      return { kind: "primitive", primitive: "string" };
+    }
+
+    // JSON.stringify(...) → string
+    if (
+      method === "stringify" &&
+      Node.isIdentifier(receiver) &&
+      receiver.getText() === "JSON"
+    ) {
+      return { kind: "primitive", primitive: "string" };
     }
 
     // .filter(...) / .slice(...) / .sort(...) — preserve receiver cardinality.
@@ -403,6 +473,10 @@ function describeOrigin(o: VarOrigin): string {
       return "literalArray";
     case "idOf":
       return `id<${o.table}>`;
+    case "idValueOf":
+      return `idValue<${o.table}>`;
+    case "primitive":
+      return o.primitive;
     case "param":
       return "param";
     default:
@@ -415,12 +489,20 @@ function classifyExpression(expr: Expression | Block, scope: Scope): ReturnInten
     return { kind: "unanalyzed", reason: "block expression body" };
   }
 
-  // unwrap parens, `as const`, `as T`, type assertions
+  // unwrap parens, `as const`, `as T`, type assertions, non-null assertion
   if (Node.isParenthesizedExpression(expr)) {
     return classifyExpression(expr.getExpression(), scope);
   }
   if (Node.isAsExpression(expr) || Node.isTypeAssertion(expr)) {
     return classifyExpression(expr.getExpression(), scope);
+  }
+  if (Node.isNonNullExpression(expr)) {
+    const inner = classifyExpression(expr.getExpression(), scope);
+    // non-null assertion strips nullability — drop the `nullable` flag on rows.
+    if (inner.kind === "row" && inner.nullable) {
+      return { ...inner, nullable: false };
+    }
+    return inner;
   }
 
   // null / undefined
@@ -434,10 +516,18 @@ function classifyExpression(expr: Expression | Block, scope: Scope): ReturnInten
     return { kind: "primitive", primitive: "boolean" };
   }
 
-  // Array literal `[...]` — treat as literalArray of first element
+  // Array literal `[...]` — treat as literalArray of first element. Empty
+  // array (`return []`) is compatible with any v.array(...) — surface as
+  // literalArray<unanalyzed> so the matcher's array-cardinality check still
+  // runs but no element-level error fires.
   if (Node.isArrayLiteralExpression(expr)) {
     const first = expr.getElements()[0];
-    if (!first) return { kind: "unanalyzed", reason: "empty array literal" };
+    if (!first) {
+      return {
+        kind: "literalArray",
+        element: { kind: "unanalyzed", reason: "empty array element" },
+      };
+    }
     return { kind: "literalArray", element: classifyExpression(first as Expression, scope) };
   }
 
@@ -637,6 +727,10 @@ function originToIntent(
       return { kind: "literalArray", element: origin.element };
     case "idOf":
       return { kind: "unanalyzed", reason: `returning bare id<${origin.table}>` };
+    case "idValueOf":
+      return { kind: "idValue", table: origin.table };
+    case "primitive":
+      return { kind: "primitive", primitive: origin.primitive };
     case "param":
       return { kind: "unanalyzed", reason: "returning a parameter" };
     default:
