@@ -109,6 +109,10 @@ type VarOrigin =
   | { kind: "idValueOf"; table: string }
   /** Primitive string/number/boolean from a recognised producer. */
   | { kind: "primitive"; primitive: "string" | "number" | "boolean" }
+  /** Result of a `ctx.runQuery/runMutation/runAction(internal.x.y, ...)` —
+   *  carries the called function's `returns` shape. Materialises as a
+   *  `passthrough` intent when used at a return site. */
+  | { kind: "shapeOf"; shape: Shape; from: string }
   | { kind: "param" }
   | { kind: "unknown"; expr: string };
 
@@ -296,6 +300,20 @@ function originFromCall(call: CallExpression, scope: Scope): VarOrigin {
     const method = expr.getName();
     const receiver = expr.getExpression();
 
+    // ctx.runQuery / runMutation / runAction(internal.x.y, ...)
+    if (
+      (method === "runQuery" || method === "runMutation" || method === "runAction") &&
+      receiverText(receiver) === "ctx" &&
+      scope.resolveRunCall
+    ) {
+      const target = call.getArguments()[0];
+      const segments = target ? readApiSegments(target) : null;
+      if (segments && segments.length > 0) {
+        const shape = scope.resolveRunCall(segments);
+        if (shape) return { kind: "shapeOf", shape, from: segments.join(".") };
+      }
+    }
+
     // Promise.all(<expr>) — recurse into <expr>'s origin.
     if (
       Node.isIdentifier(receiver) &&
@@ -482,6 +500,8 @@ function describeOrigin(o: VarOrigin): string {
       return `idValue<${o.table}>`;
     case "primitive":
       return o.primitive;
+    case "shapeOf":
+      return `shape<${o.from}>`;
     case "param":
       return "param";
     default:
@@ -795,6 +815,8 @@ function originToIntent(
       return { kind: "idValue", table: origin.table };
     case "primitive":
       return { kind: "primitive", primitive: origin.primitive };
+    case "shapeOf":
+      return { kind: "passthrough", shape: origin.shape, from: origin.from };
     case "param":
       return { kind: "unanalyzed", reason: "returning a parameter" };
     default:

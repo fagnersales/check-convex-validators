@@ -1,4 +1,5 @@
 import { Project, Node, SyntaxKind, type SourceFile, type CallExpression } from "ts-morph";
+import { resolve as pathResolve } from "node:path";
 import { parseSchema } from "./schema.ts";
 import { parseValidator, resolveRef } from "./validator.ts";
 import { analyzeHandler } from "./handler.ts";
@@ -22,7 +23,9 @@ export function run(opts: RunOptions): RunResult {
     skipAddingFilesFromTsConfig: true,
   });
 
-  const convexDir = opts.convexDir.replace(/\/$/, "");
+  // Resolve convexDir to absolute so cross-file run-call resolution can
+  // strip the prefix from `SourceFile#getFilePath()` (which is absolute).
+  const convexDir = pathResolve(opts.convexDir.replace(/\/$/, ""));
   project.addSourceFilesAtPaths([
     `${convexDir}/**/*.ts`,
     `!${convexDir}/_generated/**/*`,
@@ -71,17 +74,50 @@ export function run(opts: RunOptions): RunResult {
   }
 
   // Pass 2: classify handlers with the run-call resolver wired up.
+  // Resolves direct-defined exports first, then walks re-export chains
+  // (`export { x } from "./y"`) for barrel-style modules.
+  const resolveByRelPath = (
+    relPath: string,
+    exportName: string,
+    visited: Set<string>,
+  ): Shape | null => {
+    for (const candidate of [relPath, `${relPath}/index`]) {
+      const key = `${candidate}:${exportName}`;
+      if (visited.has(key)) continue;
+      visited.add(key);
+
+      const direct = returnsByPath.get(key);
+      if (direct) return direct;
+
+      // No direct definition — peek at the source file's re-exports.
+      const sf = project.getSourceFile(`${convexDir}/${candidate}.ts`);
+      if (!sf) continue;
+      for (const ed of sf.getExportDeclarations()) {
+        const moduleSpec = ed.getModuleSpecifierValue();
+        if (!moduleSpec || !moduleSpec.startsWith(".")) continue;
+        const targetSf = ed.getModuleSpecifierSourceFile();
+        if (!targetSf) continue;
+        const targetRel = stripConvexPrefix(
+          targetSf.getFilePath().replace(/\.tsx?$/, ""),
+          convexDir,
+        );
+        for (const ne of ed.getNamedExports()) {
+          const aliasNode = ne.getAliasNode();
+          const exportedAs = (aliasNode ?? ne.getNameNode()).getText();
+          if (exportedAs !== exportName) continue;
+          const localName = ne.getNameNode().getText();
+          const found = resolveByRelPath(targetRel, localName, visited);
+          if (found) return found;
+        }
+      }
+    }
+    return null;
+  };
   const resolveRunCall = (segments: string[]): Shape | null => {
     if (segments.length < 1) return null;
     const exportName = segments[segments.length - 1]!;
     const relPath = segments.slice(0, -1).join("/");
-    // try `<relPath>` (file) or fall back to `<relPath>/index`
-    for (const candidate of [relPath, `${relPath}/index`]) {
-      const key = `${candidate}:${exportName}`;
-      const shape = returnsByPath.get(key);
-      if (shape) return shape;
-    }
-    return null;
+    return resolveByRelPath(relPath, exportName, new Set());
   };
 
   for (const p of pending) {
@@ -110,11 +146,12 @@ export function run(opts: RunOptions): RunResult {
 }
 
 function pendingKey(convexDir: string, filePath: string, exportName: string): string {
-  // Strip convexDir prefix and `.ts` suffix to get the relative module path.
+  return `${stripConvexPrefix(filePath.replace(/\.tsx?$/, ""), convexDir)}:${exportName}`;
+}
+
+function stripConvexPrefix(path: string, convexDir: string): string {
   const dir = convexDir.endsWith("/") ? convexDir : `${convexDir}/`;
-  let rel = filePath.startsWith(dir) ? filePath.slice(dir.length) : filePath;
-  rel = rel.replace(/\.tsx?$/, "");
-  return `${rel}:${exportName}`;
+  return path.startsWith(dir) ? path.slice(dir.length) : path;
 }
 
 function filterIssues(issues: Issue[], opts: RunOptions): Issue[] {

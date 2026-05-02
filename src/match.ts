@@ -450,6 +450,30 @@ function compareShapes(expected: Shape, actual: Shape): string | null {
     }
     return `expected ${expected.kind}, no matching union member in validator`;
   }
+  // Handler returns a union (e.g. `union(literal("A"), literal("B"))`),
+  // validator is a single non-union (e.g. `v.string()`). Pass if every
+  // union member fits the actual shape.
+  if (expected.kind === "union" && actual.kind !== "union") {
+    for (const em of expected.members) {
+      const m = compareShapes(em, actual);
+      if (m) return `union member ${shapeBrief(em)} ${m}`;
+    }
+    return null;
+  }
+
+  // A handler returning a literal value is compatible with the corresponding
+  // primitive validator (e.g. handler returns `union(literal("A"), literal("B"))`,
+  // validator declares `v.string()` — every value is a valid string).
+  if (expected.kind === "literal") {
+    const t = typeof expected.value;
+    if (
+      (actual.kind === "string" && t === "string") ||
+      (actual.kind === "number" && t === "number") ||
+      (actual.kind === "boolean" && t === "boolean")
+    ) {
+      return null;
+    }
+  }
 
   if (expected.kind !== actual.kind) {
     return `expected ${expected.kind}, validator has ${actual.kind}`;
