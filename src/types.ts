@@ -107,8 +107,24 @@ export interface RunOptions {
   strict: boolean;
 }
 
+export interface Timings {
+  /** ts-morph project bootstrap + glob expansion + source-file load. */
+  fileLoadMs: number;
+  /** parseSchema(schema.ts). */
+  schemaParseMs: number;
+  /** Pass 1 — collect every query/mutation/action and resolve their args + returns validators. */
+  collectMs: number;
+  /** Pass 2 — analyze handler bodies and diff against validators. */
+  analyzeMs: number;
+  /** End-to-end wall-clock. */
+  totalMs: number;
+  /** Source files loaded into ts-morph (excludes _generated and tests). */
+  filesLoaded: number;
+}
+
 export interface RunResult {
   issues: Issue[];
   scannedFunctions: number;
   schema: SchemaModel;
+  timings: Timings;
 }

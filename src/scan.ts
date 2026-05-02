@@ -4,7 +4,14 @@ import { parseSchema } from "./schema.ts";
 import { parseValidator, resolveRef } from "./validator.ts";
 import { analyzeHandler } from "./handler.ts";
 import { matchFunction } from "./match.ts";
-import type { FunctionInfo, Issue, RunOptions, RunResult, Shape } from "./types.ts";
+import type {
+  FunctionInfo,
+  Issue,
+  RunOptions,
+  RunResult,
+  Shape,
+  Timings,
+} from "./types.ts";
 
 const FUNCTION_KINDS = new Set([
   "query",
@@ -16,6 +23,7 @@ const FUNCTION_KINDS = new Set([
 ]);
 
 export function run(opts: RunOptions): RunResult {
+  const t0 = performance.now();
   const project = new Project({
     tsConfigFilePath: undefined,
     compilerOptions: { allowJs: false, noEmit: true, target: 99 },
@@ -32,6 +40,7 @@ export function run(opts: RunOptions): RunResult {
     `!${convexDir}/**/*.test.ts`,
     `!${convexDir}/**/_test/**/*`,
   ]);
+  const tFileLoad = performance.now();
 
   const schemaPath = opts.schemaPath ?? `${convexDir}/schema.ts`;
   const schemaFile = project.getSourceFile(schemaPath);
@@ -49,10 +58,12 @@ export function run(opts: RunOptions): RunResult {
       ],
       scannedFunctions: 0,
       schema: { tables: new Map() },
+      timings: zeroTimings(t0, tFileLoad, project.getSourceFiles().length),
     };
   }
 
   const schema = parseSchema(schemaFile, project);
+  const tSchema = performance.now();
   const allIssues: Issue[] = [];
   let scanned = 0;
 
@@ -72,6 +83,7 @@ export function run(opts: RunOptions): RunResult {
       }
     }
   }
+  const tCollect = performance.now();
 
   // Pass 2: classify handlers with the run-call resolver wired up.
   // Resolves direct-defined exports first, then walks re-export chains
@@ -141,8 +153,38 @@ export function run(opts: RunOptions): RunResult {
     scanned += 1;
     allIssues.push(...matchFunction(fn, schema));
   }
+  const tAnalyze = performance.now();
 
-  return { issues: filterIssues(allIssues, opts), scannedFunctions: scanned, schema };
+  const timings: Timings = {
+    fileLoadMs: round(tFileLoad - t0),
+    schemaParseMs: round(tSchema - tFileLoad),
+    collectMs: round(tCollect - tSchema),
+    analyzeMs: round(tAnalyze - tCollect),
+    totalMs: round(tAnalyze - t0),
+    filesLoaded: project.getSourceFiles().length,
+  };
+
+  return {
+    issues: filterIssues(allIssues, opts),
+    scannedFunctions: scanned,
+    schema,
+    timings,
+  };
+}
+
+function round(ms: number): number {
+  return Math.round(ms * 10) / 10;
+}
+
+function zeroTimings(t0: number, tLoad: number, files: number): Timings {
+  return {
+    fileLoadMs: round(tLoad - t0),
+    schemaParseMs: 0,
+    collectMs: 0,
+    analyzeMs: 0,
+    totalMs: round(performance.now() - t0),
+    filesLoaded: files,
+  };
 }
 
 function pendingKey(convexDir: string, filePath: string, exportName: string): string {

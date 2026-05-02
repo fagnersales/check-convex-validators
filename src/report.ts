@@ -1,9 +1,9 @@
-import type { Issue, RunResult } from "./types.ts";
+import type { Issue, RunResult, Timings } from "./types.ts";
 
 export function reportText(result: RunResult): string {
-  const { issues, scannedFunctions } = result;
+  const { issues, scannedFunctions, timings } = result;
   if (issues.length === 0) {
-    return `✓ ${scannedFunctions} function(s) scanned, no issues found.\n`;
+    return `✓ ${scannedFunctions} function(s) scanned, no issues found.\n${timingLine(timings, scannedFunctions)}\n`;
   }
 
   const byFile = new Map<string, Issue[]>();
@@ -34,7 +34,20 @@ export function reportText(result: RunResult): string {
   lines.push(
     `Scanned ${scannedFunctions} function(s). ${errors} error(s), ${warns} warning(s), ${infos} info.`,
   );
+  lines.push(timingLine(timings, scannedFunctions));
   return lines.join("\n");
+}
+
+function timingLine(t: Timings, scanned: number): string {
+  const fnPerSec = scanned > 0 && t.totalMs > 0
+    ? Math.round((scanned / t.totalMs) * 1000)
+    : 0;
+  return `Took ${formatMs(t.totalMs)} (${t.filesLoaded} files, ${fnPerSec} fn/s) — load ${formatMs(t.fileLoadMs)} · schema ${formatMs(t.schemaParseMs)} · collect ${formatMs(t.collectMs)} · analyze ${formatMs(t.analyzeMs)}`;
+}
+
+function formatMs(ms: number): string {
+  if (ms >= 1000) return `${(ms / 1000).toFixed(2)}s`;
+  return `${Math.round(ms)}ms`;
 }
 
 export function reportJson(result: RunResult): string {
@@ -42,6 +55,7 @@ export function reportJson(result: RunResult): string {
     {
       scannedFunctions: result.scannedFunctions,
       issues: result.issues,
+      timings: result.timings,
     },
     null,
     2,
