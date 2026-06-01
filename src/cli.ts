@@ -7,6 +7,8 @@ import type { RunOptions } from "./types.ts";
 
 interface CliOptions extends RunOptions {
   htmlOut?: string;
+  printDead?: boolean;
+  deadOnly?: boolean;
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -48,6 +50,15 @@ function parseArgs(argv: string[]): CliOptions {
         if (pat) (opts.ignoreDead ??= []).push(pat);
         break;
       }
+      case "--dead":
+        opts.printDead = true;
+        opts.buildGraph = true;
+        break;
+      case "--dead-only":
+        opts.printDead = true;
+        opts.deadOnly = true;
+        opts.buildGraph = true;
+        break;
       case "-h":
       case "--help":
         printHelp();
@@ -83,6 +94,11 @@ Options:
   --ignore-dead <pattern>  Glob pattern (`*` wildcard) excluding nodes
                            from the dead list. Repeatable.
                            Examples: 'migrations:*', '*:migrate*'
+  --dead                   Print the dead-function list to stdout (one
+                           id per line, after the regular report).
+  --dead-only              Suppress the regular report; print only the
+                           dead list (text) or only the dead+ignored
+                           arrays (when combined with --json).
   -h, --help               Show this help
 
 Exit codes:
@@ -95,10 +111,31 @@ Exit codes:
 const opts = parseArgs(process.argv.slice(2));
 const result = run(opts);
 
-if (opts.format === "json") {
-  process.stdout.write(reportJson(result) + "\n");
+if (opts.deadOnly) {
+  if (opts.format === "json") {
+    const ignored = result.graph
+      ? result.graph.nodes.filter((n) => n.ignored).map((n) => n.id)
+      : [];
+    process.stdout.write(
+      JSON.stringify({ dead: result.graph?.dead ?? [], ignored }, null, 2) + "\n",
+    );
+  } else if (result.graph) {
+    for (const id of result.graph.dead) process.stdout.write(id + "\n");
+  }
 } else {
-  process.stdout.write(reportText(result));
+  if (opts.format === "json") {
+    process.stdout.write(reportJson(result) + "\n");
+  } else {
+    process.stdout.write(reportText(result));
+  }
+
+  if (opts.printDead && result.graph) {
+    if (opts.format !== "json") {
+      const g = result.graph;
+      process.stdout.write(`\nDead functions (${g.dead.length}):\n`);
+      for (const id of g.dead) process.stdout.write(`  ${id}\n`);
+    }
+  }
 }
 
 if (opts.htmlOut && result.graph) {

@@ -51,11 +51,21 @@ function formatMs(ms: number): string {
 }
 
 export function reportJson(result: RunResult): string {
+  const graph = result.graph
+    ? {
+        dead: result.graph.dead,
+        ignored: result.graph.nodes.filter((n) => n.ignored).map((n) => n.id),
+        nodeCount: result.graph.nodes.length,
+        edgeCount: result.graph.edges.length,
+        scannedFiles: result.graph.scannedFiles,
+      }
+    : undefined;
   return JSON.stringify(
     {
       scannedFunctions: result.scannedFunctions,
       issues: result.issues,
       timings: result.timings,
+      ...(graph ? { graph } : {}),
     },
     null,
     2,
