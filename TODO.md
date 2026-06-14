@@ -101,3 +101,28 @@ Roadmap for `check-convex-validators`. Each rule maps to a class of `ReturnsVali
 - [ ] GitHub Action (`actions/setup-bun` + run check) as a starter workflow.
 - [ ] Versioned changelog.
 - [ ] Self-host: run the analyzer on its own fixture suite as part of `bun test`.
+
+## Best-practice lints — deferred / coverage gaps (from the full docs audit)
+
+Documented Convex practices NOT yet enforced, with the reason (honesty over
+pretending to cover):
+
+- [ ] `IMPLICIT_TABLE_ID` — the 6th `@convex-dev/eslint-plugin` rule (`db.get(id)`
+      → `db.get("table", id)`). Completes parity, but fires on every legacy by-id
+      op → highest-volume rule. Ship off-by-default / gated behind `convex>=1.31.0`.
+- [ ] Search/vector index `.eq()` on a field that isn't a declared `filterField`
+      — a genuine runtime footgun tsc CANNOT see. Build after schema index-name
+      plumbing lands. (Highest-value beyond-tsc deferred rule.)
+- [ ] `RESERVED_FIELD_NAME` / invalid-index checks (dup fields, >16 fields,
+      explicit `_creationTime`) — loud deploy rejections, near-zero survival in
+      committed code; value is pre-deploy/editor only.
+- [ ] Same-runtime `runAction` — needs the cross-file graph resolver (R15) to
+      compare `isUseNode` on both ends; mis-resolution is worse than a miss.
+- [ ] ctx-param-name resolution — ctx-anchored rules hardcode `ctx`, so they
+      under-report when a handler renames its first param (FP-safe, recall only).
+
+Genuinely NOT statically decidable (deliberately omitted, never guessed):
+auth/access-control on public functions (auth via arbitrary helper or unguessable
+id; legit-public endpoints need none), `paginationOptsValidator` usage (style),
+custom-function-wrapper team conventions, storing Date/Map/class instances in the
+DB (needs the type-checker).

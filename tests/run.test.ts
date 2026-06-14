@@ -13,6 +13,9 @@ function runFix(fixture: string) {
     includeUnanalyzed: false,
     format: "text",
     strict: false,
+    // Drift-matcher tests run with lint OFF so their fixtures stay focused on
+    // returns-validator drift. The lint rules have their own suite below.
+    lint: false,
   };
   return run(opts);
 }

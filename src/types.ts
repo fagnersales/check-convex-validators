@@ -111,7 +111,67 @@ export type IssueCode =
   | "UNANALYZED"
   /** The analyzer itself threw while processing one function — emitted so a
    *  single bad function never silently drops out of the report. */
-  | "ANALYZER_ERROR";
+  | "ANALYZER_ERROR"
+  // ── Best-practice / lint codes (emitted only when RunOptions.lint) ──────
+  /** `await ctx.db.*` / `ctx.runX` / `ctx.scheduler.*` inside a for/for-of loop
+   *  — sequential round-trips that should be parallelized with Promise.all. */
+  | "AWAIT_IN_LOOP"
+  /** `.filter(...)` on a `ctx.db.query(...)` chain — scans the table; use an
+   *  index (`.withIndex`) or filter in plain TypeScript instead. */
+  | "FILTER_IN_QUERY"
+  /** `.collect()` on an unindexed query — can load the whole table; bound it
+   *  with `.withIndex`, `.take(n)`, or `.paginate()`. */
+  | "UNBOUNDED_COLLECT"
+  /** Multiple sequential `await ctx.runMutation(...)` in one action — each is a
+   *  separate transaction; consolidate into one. */
+  | "SEQUENTIAL_CTX_RUN"
+  /** `Date.now()` / `Math.random()` / `new Date()` in a query — breaks the
+   *  reactive cache (results never update with wall-clock time). */
+  | "NONDETERMINISTIC_QUERY"
+  /** A public function with no `args:` validator — unvalidated client input. */
+  | "MISSING_ARG_VALIDATOR"
+  /** `query(fn)` instead of `query({ handler: fn })` — the bare-function form
+   *  can't carry `args`/`returns` validators. */
+  | "OLD_FUNCTION_SYNTAX"
+  /** Scheduling / `ctx.runX` against a PUBLIC `api.*` reference instead of
+   *  `internal.*` — exposes server-internal calls on the public API surface. */
+  | "SCHEDULE_PUBLIC_FN"
+  /** A default-runtime (V8) file importing from a `"use node"` file — the Node
+   *  module can't load in the Convex runtime. */
+  | "WRONG_RUNTIME_IMPORT"
+  /** A promise-returning `ctx.*` call left un-awaited at statement position — the
+   *  write/schedule may never happen and errors are swallowed. */
+  | "FLOATING_CTX_PROMISE"
+  /** `fetch()` (or other third-party I/O) inside a query/mutation — not available
+   *  in the V8 query/mutation isolate; throws. Belongs in an action. */
+  | "FETCH_IN_QUERY"
+  /** `ctx.db.*` inside an action handler — ActionCtx has no `db`; actions reach
+   *  the database via ctx.runQuery / ctx.runMutation. */
+  | "DB_IN_ACTION"
+  /** A query/mutation registered in a `"use node"` file — can't run in Node;
+   *  the deploy is rejected. */
+  | "QUERY_IN_NODE_FILE"
+  /** A Node-only builtin (`node:fs`, `path`, …) imported in a default-runtime
+   *  file with no `"use node"` directive. */
+  | "NODE_BUILTIN_WITHOUT_USE_NODE"
+  /** A `"use node"` directive that is not in the file prologue — silently dropped
+   *  by the bundler, so the file is wrongly treated as a V8 file. */
+  | "MISPLACED_USE_NODE"
+  /** A cron job (`crons.interval`/`daily`/…) scheduling a public `api.*` function
+   *  instead of `internal.*`. */
+  | "CRON_PUBLIC_FN"
+  /** Two cron jobs registered with the same identifier — Convex rejects the
+   *  deploy ("Cron identifier registered twice"). */
+  | "DUPLICATE_CRON_ID"
+  /** `ctx.runQuery` / `ctx.runMutation` inside a query/mutation — same-transaction
+   *  overhead with no benefit; use a plain TypeScript helper. */
+  | "CTX_RUN_IN_QUERY_OR_MUTATION"
+  /** A schema index whose field list is a strict prefix of another index on the
+   *  same table (`by_a` when `by_a_b` exists) — usually droppable. */
+  | "REDUNDANT_INDEX"
+  /** `defineSchema(..., { schemaValidation: false })` — Convex stops enforcing the
+   *  schema at runtime, voiding the invariant the drift detector relies on. */
+  | "SCHEMA_VALIDATION_DISABLED";
 
 /** A concrete, copy-pasteable fix suggestion. Only the relevant keys are set. */
 export interface FixCode {
@@ -159,6 +219,11 @@ export interface RunOptions {
   includeUnanalyzed: boolean;
   format: "text" | "json";
   strict: boolean;
+  /** Run the best-practice / lint rules (await-in-loop, .filter-in-query,
+   *  unbounded .collect, missing arg validators, etc.) in addition to the
+   *  returns-validator drift checks. The CLI defaults this ON; the core
+   *  `run()` defaults it OFF so drift-only callers stay unaffected. */
+  lint?: boolean;
   /** When set, also build a call graph for HTML output. */
   buildGraph?: boolean;
   /** Root directory to scan for callers (default: parent of convexDir). */

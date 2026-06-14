@@ -44,14 +44,9 @@ export function summarize(issues: Issue[], scannedFunctions: number): RunSummary
   let errors = 0;
   let warns = 0;
   let infos = 0;
-  const byCategory = {
-    "schema-drift": 0,
-    nullability: 0,
-    cardinality: 0,
-    "type-mismatch": 0,
-    "literal-shape": 0,
-    coverage: 0,
-  } as Record<DiagCategory, number>;
+  const byCategory = Object.fromEntries(
+    CATEGORY_ORDER.map((c) => [c, 0]),
+  ) as Record<DiagCategory, number>;
   const byCode: Partial<Record<IssueCode, number>> = {};
   const affected = new Set<string>();
 

@@ -7,6 +7,7 @@ import { matchFunction } from "./match.ts";
 import { buildGraph } from "./graph.ts";
 import { summarize } from "./report.ts";
 import { makeIssue } from "./rules.ts";
+import { lintProject } from "./lint.ts";
 import type {
   CallGraph,
   FunctionInfo,
@@ -209,6 +210,30 @@ export function run(opts: RunOptions): RunResult {
     }
   }
   const tAnalyze = performance.now();
+
+  // Best-practice / lint pass — opt-in via RunOptions.lint (CLI defaults it on).
+  // Independent of the drift pipeline; runs over the same loaded source files.
+  if (opts.lint) {
+    try {
+      allIssues.push(
+        ...lintProject({
+          sourceFiles: project.getSourceFiles(),
+          schemaFilePath: schemaFile?.getFilePath(),
+        }),
+      );
+    } catch (err) {
+      allIssues.push(
+        makeIssue("ANALYZER_ERROR", {
+          severity: "warn",
+          filePath: convexDir,
+          line: 0,
+          function: "<lint>",
+          message: `Lint pass threw and was skipped`,
+          detail: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
+  }
 
   let graph: CallGraph | undefined;
   if (opts.buildGraph) {

@@ -1,12 +1,11 @@
 # check-convex-validators
 
-Static analyzer that catches `ReturnsValidationError` drift in Convex codebases — _before_ deploy.
+Static analyzer for Convex codebases — _before_ deploy. Two layers in one pass:
 
-The bug class it targets:
+1. **Returns-validator drift** — the `returns` validator on a query/mutation drifts away from the schema, the handler return shape, or both, so it passes typecheck but throws `ReturnsValidationError` at runtime when a real row is returned.
+2. **Best-practice lints** — the Convex anti-patterns (`await` in a loop, `.filter` on a query, unbounded `.collect`, nondeterministic queries, missing arg validators, …), including the rules the official `@convex-dev/eslint-plugin` ships. These fire on _any_ Convex code, whether or not the project uses `returns` validators, and run by default — no ESLint install or config required (`--no-lint` to skip).
 
-> The `returns` validator on a query/mutation drifts away from the schema, the handler return shape, or both — so the validator passes typecheck but throws at runtime when a real row is returned.
-
-It walks `convex/schema.ts` + every `query | mutation | action | internal*` definition, infers what each handler can return, and compares that against the declared `returns` validator. Issues are emitted with file/line for fast triage.
+It walks `convex/schema.ts` + every `query | mutation | action | internal*` definition, infers what each handler can return, compares that against the declared `returns` validator, and lints each handler body. Issues are emitted with file/line for fast triage.
 
 ## Quick start
 
@@ -38,6 +37,43 @@ bunx check-convex-validators --convex-dir backend/convex
 
 Every diagnostic is rendered with a plain-language **why it matters**, a concrete **fix** (often a copy-pasteable `v.*` snippet), a source excerpt with a caret on the offending field, and a Convex docs link. Output is grouped by category with a headline summarizing how many functions will throw `ReturnsValidationError` at runtime. Add `--json` for a versioned, CI-friendly contract (`schemaVersion`, `summary`, and the rich per-issue fields).
 
+## Best-practice lints
+
+Run by default alongside the drift checks (`--no-lint` to disable). They encode the [Convex best-practices guide](https://docs.convex.dev/understanding/best-practices/) plus the rules from the official [`@convex-dev/eslint-plugin`](https://docs.convex.dev/eslint), so you get the whole sweep from one CLI without installing or configuring ESLint.
+
+| Code | Severity | Description |
+| --- | --- | --- |
+| `AWAIT_IN_LOOP` | warn / info | `await ctx.db.*` / `ctx.runQuery` inside a `for`/`for-of` loop — sequential round-trips to parallelize with `Promise.all`. **warn** for reads; **info** for writes (parallel writes to the same doc can conflict). Loop-carried accumulators and pagination cursors are not flagged. |
+| `FILTER_IN_QUERY` | warn | `.filter()` on a `ctx.db.query(...)` chain — scans the table; use `.withIndex` or filter in plain TypeScript. (JS array `.filter`, and the documented `.paginate()` exception, are not flagged.) |
+| `UNBOUNDED_COLLECT` | warn | `.collect()` on a query with no index narrowing — can load the whole table. Bound with `.withIndex`, `.take(n)`, or `.paginate()`. |
+| `NONDETERMINISTIC_QUERY` | warn | `Date.now()` / `Math.random()` / `new Date()` inside a **query** — breaks the reactive cache (the value never updates with wall-clock time). Allowed in mutations/actions. |
+| `SEQUENTIAL_CTX_RUN` | info | Multiple `await ctx.runMutation(...)` in one action — each is a separate transaction; consolidate for atomicity. |
+| `MISSING_ARG_VALIDATOR` | warn / info | A function with no `args` validator. **warn** for public functions (client input reaches the handler unchecked); **info** for `internal*`. |
+| `OLD_FUNCTION_SYNTAX` | warn | `query(fn)` instead of `query({ handler })` — the bare-function form can't carry `args`/`returns` validators. |
+| `SCHEDULE_PUBLIC_FN` | warn | `ctx.scheduler` / `ctx.runX` referencing a public `api.*` function — the Convex guide says to ensure these use `internal.*`, since a public function is reachable by any client (security). |
+| `WRONG_RUNTIME_IMPORT` | warn | A default-runtime (V8) file importing from a `"use node"` module — the Node code can't load in Convex's V8 isolate. |
+| `FLOATING_CTX_PROMISE` | warn | A promise-returning `ctx.*` call (write/schedule/run) left un-awaited at statement position — it may never run and errors are swallowed. |
+| `FETCH_IN_QUERY` | error | `fetch()` inside a query/mutation — the V8 isolate has no `fetch`; it throws. Belongs in an action. |
+| `DB_IN_ACTION` | error | `ctx.db` used in an action — `ActionCtx` has no `db`; use `ctx.runQuery` / `ctx.runMutation`. |
+| `QUERY_IN_NODE_FILE` | error | A query/mutation in a `"use node"` file — can't run in Node; deploy is rejected. |
+| `NODE_BUILTIN_WITHOUT_USE_NODE` | warn | A Node builtin (`node:fs`, `path`, …) imported in a file with no `"use node"`. |
+| `MISPLACED_USE_NODE` | warn | A `"use node"` directive not at the top of the file — silently ignored by the bundler. |
+| `CRON_PUBLIC_FN` | warn | A cron job scheduling a public `api.*` function (the "check crons.ts" half of `SCHEDULE_PUBLIC_FN`). |
+| `DUPLICATE_CRON_ID` | error | Two cron jobs registered with the same identifier — Convex rejects the deploy. |
+| `CTX_RUN_IN_QUERY_OR_MUTATION` | info | `ctx.runQuery` / `ctx.runMutation` inside a query/mutation — overhead with no benefit; use a plain helper. (Components are exempted.) |
+| `REDUNDANT_INDEX` | warn | A schema index whose fields are a prefix of another index on the same table (`by_a` when `by_a_b` exists). |
+| `SCHEMA_VALIDATION_DISABLED` | info | `defineSchema(..., { schemaValidation: false })` — schema is no longer enforced at runtime. |
+
+Each rule deep-links to the exact Convex doc section it enforces. Documented practices that are *not* statically decidable (auth checks on public functions, same-runtime `runAction`) are deliberately left out rather than guessed at — see `TODO.md`.
+
+### Before/after HTML report
+
+`--lint-html <path>` writes a self-contained HTML report that renders every finding as a **before** (your real source) / **after** (the recommended fix) pair. Where it can, the "after" is rewritten with your own variable names (e.g. `AWAIT_IN_LOOP` becomes the exact `Promise.all(...)` for your loop), so it is copy-pasteable. When run inside a git repo with a GitHub remote, the report shows the project name and the scanned commit, and each finding deep-links to a GitHub blob permalink pinned to that SHA.
+
+```bash
+bunx check-convex-validators --convex-dir convex --lint-html report.html
+```
+
 ### Realistic patterns it understands
 
 Foreign-key joins (`ctx.db.get(row.fkId)`), enrichment spreads (`{ ...row, related }` with the related doc/array diffed against the nested validator), `ctx.storage.getUrl()` as `string | null`, direct `return result.page`, count queries (`rows.length`), value-bounded literals (`return "active"` vs `v.literal(...)`), `v.optional(v.object(...))` returns, the paginated envelope (`isDone` / `continueCursor`), spread schema tables (`...sharedTables`), `satisfies Validator<…>`, and shared validators referenced by multiple fields.
@@ -63,6 +99,8 @@ Foreign-key joins (`ctx.db.get(row.fkId)`), enrichment spreads (`{ ...row, relat
 --include-unanalyzed    Print INFO entries for unanalyzed handlers
 --json                  Machine-readable output
 --strict                Exit nonzero on warnings too
+--no-lint               Skip best-practice lints (drift checks only)
+--lint-html <path>      Write an HTML report of the lints as before/after pairs
 -h, --help              Show help
 ```
 
@@ -76,6 +114,7 @@ const result = run({
   format: "text",
   includeUnanalyzed: false,
   strict: false,
+  lint: true, // run the best-practice lints too (default off in the library API)
 });
 console.log(reportText(result));
 process.exit(exitCode(result, false));
@@ -83,7 +122,9 @@ process.exit(exitCode(result, false));
 
 ## Status
 
-v0.2.0 — high-frequency drift patterns + R4 recursive type compare,
+v0.3.0 — adds the best-practice lint layer (9 rules covering the Convex
+anti-patterns + the official ESLint plugin's rules), on top of the existing
+drift engine: high-frequency drift patterns + R4 recursive type compare,
 discriminated-union scoring, both-branch ternary, `.map`/`Promise.all`
 tracing, and `ctx.runQuery/runMutation/runAction` cross-fn propagation.
 See `TODO.md` for known gaps and roadmap.
