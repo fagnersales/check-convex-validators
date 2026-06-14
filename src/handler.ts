@@ -3,6 +3,7 @@ import {
   SyntaxKind,
   type ArrowFunction,
   type FunctionExpression,
+  type FunctionDeclaration,
   type ReturnStatement,
   type Block,
   type Identifier,
@@ -35,7 +36,7 @@ export interface AnalyzeContext {
   resolveRunCall?: (segments: string[]) => Shape | null;
 }
 
-type HandlerFn = ArrowFunction | FunctionExpression;
+export type HandlerFn = ArrowFunction | FunctionExpression | FunctionDeclaration;
 
 /**
  * Analyze every return statement in the handler body, classify each into a
@@ -43,6 +44,12 @@ type HandlerFn = ArrowFunction | FunctionExpression;
  */
 export function analyzeHandler(handler: HandlerFn, ctx: AnalyzeContext = {}): ReturnIntent[] {
   const body = handler.getBody();
+  if (!body) {
+    // A bodyless function declaration (e.g. an overload signature) — nothing to
+    // analyze. Only reachable now that named-reference handlers can resolve to a
+    // FunctionDeclaration.
+    return [{ kind: "unanalyzed", reason: "handler has no body" }];
+  }
   if (!Node.isBlock(body)) {
     // arrow with expression body
     return [classifyExpression(body, buildScope(handler, ctx))];
@@ -623,6 +630,23 @@ function originFromCall(call: CallExpression, scope: Scope): VarOrigin {
 
     // ctx.db.normalizeId / .system.* / etc — give up
     return { kind: "unknown", expr: call.getText().slice(0, 80) };
+  }
+
+  // Global coercion builtins with a bare-identifier callee produce a definite
+  // leaf type even from an arbitrary argument: String(x) → string, Number(x) →
+  // number, Boolean(x) → boolean. An explicitly-reassigned field like
+  // `{ ...row, sortKey: String(row.sortKey) }` therefore drifts when the
+  // validator wants a number. (Mirrors the JSON.stringify → string case above;
+  // found by the sensitivity audit on geospatial / workpool / expo-push.)
+  if (Node.isIdentifier(expr)) {
+    switch (expr.getText()) {
+      case "String":
+        return { kind: "primitive", primitive: "string" };
+      case "Number":
+        return { kind: "primitive", primitive: "number" };
+      case "Boolean":
+        return { kind: "primitive", primitive: "boolean" };
+    }
   }
 
   return { kind: "unknown", expr: call.getText().slice(0, 80) };

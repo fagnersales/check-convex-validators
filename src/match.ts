@@ -436,7 +436,27 @@ function diffRowAgainstObject(
   for (const [k, v] of expectedAfterDrop) {
     if (k.startsWith("__spread:")) continue;
     if (!validatorFields.has(k)) {
-      if (hasUnresolvedSpread) continue; // spread might cover this field
+      // A handler-ADDED extra (`{ ...row, bogus: 1 }`) that isn't a real column
+      // of the table is a field the validator rejects at runtime — and a
+      // `...schema.tables.<T>.validator.fields` spread can only ever contribute
+      // the table's OWN fields, never this invented key. So the spread does NOT
+      // excuse it: report it as an extra field. (Found by the sensitivity audit
+      // on aggregate.listTreeNodes / better-auth.)
+      const isAddedExtra = intent.add.has(k) && !expected.has(k);
+      if (isAddedExtra) {
+        issues.push(
+          makeIssue("EXTRA_LITERAL_FIELD", {
+            severity: "error",
+            filePath: fn.filePath,
+            line: fn.line,
+            function: fn.exportName,
+            message: `Handler returns field "${k}", which the validator doesn't declare — Convex rejects extra fields`,
+            fixCode: { remove: k },
+          }),
+        );
+        continue;
+      }
+      if (hasUnresolvedSpread) continue; // spread might cover this real column
       const after = fieldSource(k, v);
       issues.push(
         makeIssue("MISSING_FIELD", {

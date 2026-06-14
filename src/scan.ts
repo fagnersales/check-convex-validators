@@ -2,7 +2,7 @@ import { Project, Node, SyntaxKind, type SourceFile, type CallExpression } from 
 import { resolve as pathResolve, dirname as pathDirname } from "node:path";
 import { parseSchema } from "./schema.ts";
 import { parseValidator, resolveRef } from "./validator.ts";
-import { analyzeHandler } from "./handler.ts";
+import { analyzeHandler, type HandlerFn } from "./handler.ts";
 import { matchFunction } from "./match.ts";
 import { buildGraph } from "./graph.ts";
 import { summarize } from "./report.ts";
@@ -48,14 +48,22 @@ export function run(opts: RunOptions): RunResult {
 
   const schemaPath = opts.schemaPath ?? `${convexDir}/schema.ts`;
   const schemaFile = project.getSourceFile(schemaPath);
-  if (!schemaFile) {
+  // Schema is OPTIONAL in Convex. Only treat a missing schema as a hard error
+  // when there are NO Convex source files at all — that's almost always a wrong
+  // --convex-dir/--schema path. A dir with function files but no schema.ts is a
+  // valid *schemaless* project (common in quick / AI-generated apps): analyze it
+  // against an empty, permissive schema. Returns validators backed by
+  // literal/primitive/explicit shapes are still checked; db-backed reads can't
+  // resolve a row shape without a schema, so they conservatively degrade to
+  // UNANALYZED rather than erroring out the whole run.
+  if (!schemaFile && project.getSourceFiles().length === 0) {
     const issues = [
       makeIssue("ANALYZER_ERROR", {
         severity: "error",
         filePath: schemaPath,
         line: 0,
         function: "<schema>",
-        message: `Schema file not found at ${schemaPath}. Pass --schema <path> or --convex-dir <path> if your schema lives elsewhere.`,
+        message: `No Convex source files found under ${convexDir} (and no schema at ${schemaPath}). Pass --convex-dir <path> or --schema <path> if your code lives elsewhere.`,
       }),
     ];
     return {
@@ -68,7 +76,7 @@ export function run(opts: RunOptions): RunResult {
     };
   }
 
-  const schema = parseSchema(schemaFile, project);
+  const schema = schemaFile ? parseSchema(schemaFile, project) : { tables: new Map() };
   const tSchema = performance.now();
   const allIssues: Issue[] = [];
   let scanned = 0;
@@ -80,7 +88,7 @@ export function run(opts: RunOptions): RunResult {
   const returnsByPath = new Map<string, Shape>(); // "<relpath>:<exportName>" → shape
 
   for (const sf of project.getSourceFiles()) {
-    if (sf.getFilePath() === schemaFile.getFilePath()) continue;
+    if (schemaFile && sf.getFilePath() === schemaFile.getFilePath()) continue;
     for (const p of collectPending(sf, project)) {
       pending.push(p);
       if (p.returnsValidator) {
@@ -140,13 +148,36 @@ export function run(opts: RunOptions): RunResult {
 
   const collected: FunctionInfo[] = [];
   for (const p of pending) {
-    if (!Node.isArrowFunction(p.handlerNode) && !Node.isFunctionExpression(p.handlerNode)) {
+    // Resolve the handler to an analyzable function. A `handler:` value is often
+    // NOT an inline arrow — components commonly factor the body out as
+    // `handler: fooHandler` (a named reference). Following that reference instead
+    // of skipping it is essential: a silently-skipped handler is never checked
+    // AND never reported, so a returns-validated function with real drift would
+    // pass invisibly. (Found by the sensitivity audit on aggregate / launchdarkly
+    // / rag.)
+    const handlerFn = resolveHandlerFn(p.handlerNode);
+    if (!handlerFn) {
+      // Couldn't follow it (e.g. a wrapped `customQuery(...)` handler). Don't
+      // drop it silently — mark UNANALYZED so coverage stays honest. matchFunction
+      // emits nothing when there's no returns validator, so this adds no noise.
+      const fn: FunctionInfo = {
+        filePath: p.sf.getFilePath(),
+        line: p.decl.getStartLineNumber(),
+        exportName: p.decl.getName(),
+        kind: p.fnKind,
+        returnsValidator: p.returnsValidator,
+        returnsValidatorLine: p.returnsLine,
+        intents: [{ kind: "unanalyzed", reason: "handler is not an inline or resolvable named function" }],
+      };
+      collected.push(fn);
+      scanned += 1;
+      allIssues.push(...matchFunction(fn, schema));
       continue;
     }
     // Isolate analysis per function: a single pathological handler must never
     // crash the whole run or silently drop out of the report. (C10)
     try {
-      const intents = analyzeHandler(p.handlerNode, {
+      const intents = analyzeHandler(handlerFn, {
         argsShape: p.argsShape,
         schema,
         resolveRunCall,
@@ -305,6 +336,39 @@ function collectPending(sf: SourceFile, project: Project): Pending[] {
   }
 
   return out;
+}
+
+/**
+ * Resolve a `handler:` value to an analyzable function. Inline arrows /
+ * function-expressions are returned directly; a named reference
+ * (`handler: fooHandler`) is followed to its declaration — a `const fooHandler =
+ * async (...) => {...}` or `function fooHandler(...) {...}`, including imports
+ * across files (ts-morph getDefinitionNodes resolves them). Returns null for
+ * anything we can't follow statically (e.g. a wrapped `customQuery(...)` call),
+ * so the caller can record honest UNANALYZED coverage instead of silently
+ * dropping the function.
+ */
+function resolveHandlerFn(node: Node): HandlerFn | null {
+  if (Node.isArrowFunction(node) || Node.isFunctionExpression(node)) return node;
+  if (Node.isFunctionDeclaration(node) && node.getBody()) return node;
+  if (Node.isIdentifier(node)) {
+    let defs: Node[] = [];
+    try {
+      defs = node.getDefinitionNodes();
+    } catch {
+      defs = [];
+    }
+    for (const d of defs) {
+      if (Node.isFunctionDeclaration(d) && d.getBody()) return d;
+      if (Node.isVariableDeclaration(d)) {
+        const init = d.getInitializer();
+        if (init && (Node.isArrowFunction(init) || Node.isFunctionExpression(init))) {
+          return init;
+        }
+      }
+    }
+  }
+  return null;
 }
 
 function getFunctionKind(call: CallExpression): FunctionInfo["kind"] | null {

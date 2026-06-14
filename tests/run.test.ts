@@ -585,6 +585,43 @@ describe("`.map` callback destructure shadows an outer variable (presence FP)", 
   });
 });
 
+describe("false negatives fixed by the sensitivity (fault-injection) audit", () => {
+  // FIX A — String()/Number()/Boolean() coercion produces a definite leaf type;
+  // a coerced field that drifts from the validator must be caught (was: `any`).
+  test("String() coercion drift is caught", () => {
+    const tm = fnIssues("false-negatives", "coerced").find((i) => i.code === "TYPE_MISMATCH");
+    expect(tm).toBeDefined();
+    expect(tm!.message).toContain("sortKey");
+  });
+  // FIX B — a named-reference handler imported from another file is resolved and
+  // analyzed, not silently skipped (the common component `handler: fooHandler`).
+  test("imported named-reference handler is resolved and its drift caught", () => {
+    const tm = fnIssues("false-negatives", "getPointNamed").find((i) => i.code === "TYPE_MISMATCH");
+    expect(tm).toBeDefined();
+    expect(tm!.message).toContain("sortKey");
+  });
+  // FIX B guardrail — an unfollowable wrapped handler degrades to UNANALYZED
+  // (honest), neither crashing nor silently passing.
+  test("unfollowable wrapped handler degrades to UNANALYZED, not a silent pass", () => {
+    const r = run({
+      convexDir: `${FIX}false-negatives/convex`,
+      schemaPath: undefined,
+      includeUnanalyzed: true,
+      format: "text",
+      strict: false,
+    });
+    const codes = r.issues.filter((i) => i.function === "wrappedHandler").map((i) => i.code);
+    expect(codes).toContain("UNANALYZED");
+  });
+  // FIX C — an extra field the handler adds, hidden behind an unresolved
+  // `...schema.tables.X.validator.fields` spread, is still caught.
+  test("handler extra field behind an unresolved spread is caught", () => {
+    const ex = fnIssues("false-negatives", "extraBehindSpread").find((i) => i.code === "EXTRA_LITERAL_FIELD");
+    expect(ex).toBeDefined();
+    expect(ex!.message).toContain("bogus");
+  });
+});
+
 describe("computed string-concat enrichment field", () => {
   test("`u.first + \" \" + u.last` is a string → flagged vs v.number()", () => {
     const tm = fnIssues("realistic-followups", "enrich").find((i) => i.code === "TYPE_MISMATCH");
@@ -696,7 +733,8 @@ describe("rich text formatter (A6)", () => {
 });
 
 describe("analyzer never crashes the whole run (C10)", () => {
-  test("schema-not-found yields an ANALYZER_ERROR, not a throw", () => {
+  // No source files at all (wrong path) → still a hard ANALYZER_ERROR.
+  test("empty/wrong dir (no source files) yields an ANALYZER_ERROR, not a throw", () => {
     const r = run({
       convexDir: `${FIX}/does-not-exist/convex`,
       schemaPath: undefined,
@@ -705,5 +743,31 @@ describe("analyzer never crashes the whole run (C10)", () => {
       strict: false,
     });
     expect(r.issues.some((i) => i.code === "ANALYZER_ERROR")).toBe(true);
+  });
+});
+
+describe("schemaless project (schema.ts is optional in Convex)", () => {
+  // Regression: convex-demos/args-validation has function files but no schema.ts.
+  // ccv used to abort the whole run with an error-severity ANALYZER_ERROR.
+  test("missing schema.ts with real functions → NOT an analyzer error", () => {
+    const { issues } = go("schemaless");
+    expect(issues.some((i) => i.code === "ANALYZER_ERROR")).toBe(false);
+  });
+  test("literal-returns drift is still caught without a schema", () => {
+    const tm = fnIssues("schemaless", "badLiteral").find((i) => i.code === "TYPE_MISMATCH");
+    expect(tm).toBeDefined();
+    expect(tm!.message).toContain("status");
+  });
+  test("db-backed read degrades to UNANALYZED (conservative, not a false pass)", () => {
+    const r = run({
+      convexDir: `${FIX}schemaless/convex`,
+      schemaPath: undefined,
+      includeUnanalyzed: true,
+      format: "text",
+      strict: false,
+    });
+    const codes = r.issues.filter((i) => i.function === "listThings").map((i) => i.code);
+    expect(codes).toContain("UNANALYZED");
+    expect(codes).not.toContain("TYPE_MISMATCH");
   });
 });
