@@ -279,6 +279,56 @@ export const RULE_META: Record<Issue["code"], RuleMeta> = {
   },
 };
 
+/**
+ * How much judgment an agent needs to apply a rule's fix. Surfaced per group by
+ * `convex-doctor groups` so an automated fixer knows how hard to think:
+ *  - `mechanical` — the diagnostic fully determines the edit (remove or move a
+ *    line); safe to apply without reading the surrounding code.
+ *  - `guided` — a deterministic recipe, but the agent must read local context
+ *    (the field's schema type, the loop body, the query chain) to write it.
+ *  - `manual` — architectural / cross-file / data-migration judgment; the agent
+ *    should reason, may need to restructure, and may need to ask first.
+ */
+export type AutofixCapability = "mechanical" | "guided" | "manual";
+
+/** Per-code fix capability. `Record<IssueCode, …>` keeps this exhaustive — a new
+ *  code won't compile until it is classified here. */
+export const AUTOFIX: Record<Issue["code"], AutofixCapability> = {
+  // schema-drift / validator edits — precise, local validator changes
+  MISSING_FIELD: "guided",
+  STALE_FIELD: "mechanical",
+  OPTIONALITY_MISMATCH: "mechanical",
+  TYPE_MISMATCH: "guided",
+  NULL_BRANCH_MISSING: "guided",
+  CARDINALITY_MISMATCH: "guided",
+  EXTRA_LITERAL_FIELD: "guided",
+  MISSING_LITERAL_FIELD: "guided",
+  // coverage — not a fix, a thing to verify by hand
+  UNANALYZED: "manual",
+  ANALYZER_ERROR: "manual",
+  // best-practice / lint — recipes that need the handler's context
+  AWAIT_IN_LOOP: "guided",
+  FILTER_IN_QUERY: "guided",
+  UNBOUNDED_COLLECT: "guided",
+  SEQUENTIAL_CTX_RUN: "guided",
+  NONDETERMINISTIC_QUERY: "guided",
+  MISSING_ARG_VALIDATOR: "guided",
+  OLD_FUNCTION_SYNTAX: "guided",
+  SCHEDULE_PUBLIC_FN: "guided",
+  WRONG_RUNTIME_IMPORT: "manual",
+  FLOATING_CTX_PROMISE: "guided",
+  FETCH_IN_QUERY: "manual",
+  DB_IN_ACTION: "manual",
+  QUERY_IN_NODE_FILE: "manual",
+  NODE_BUILTIN_WITHOUT_USE_NODE: "guided",
+  MISPLACED_USE_NODE: "mechanical",
+  CRON_PUBLIC_FN: "guided",
+  DUPLICATE_CRON_ID: "guided",
+  CTX_RUN_IN_QUERY_OR_MUTATION: "guided",
+  REDUNDANT_INDEX: "guided",
+  SCHEMA_VALIDATION_DISABLED: "manual",
+};
+
 /** Stable category ordering for grouped output (most actionable first). */
 export const CATEGORY_ORDER: DiagCategory[] = [
   "schema-drift",

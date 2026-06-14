@@ -1,11 +1,21 @@
 #!/usr/bin/env bun
 import { run } from "./scan.ts";
-import { reportText, reportJson, exitCode } from "./report.ts";
+import {
+  reportText,
+  reportJson,
+  reportGroupsText,
+  reportGroupsJson,
+  summarize,
+  exitCode,
+} from "./report.ts";
+import { CATEGORY_ORDER, RULE_META } from "./rules.ts";
 import type { RunOptions } from "./types.ts";
 
 interface CliOptions extends RunOptions {
   printDead?: boolean;
   deadOnly?: boolean;
+  /** Restrict the report to a single rule code or category (the agentic group). */
+  only?: string;
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -35,6 +45,9 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case "--strict":
         opts.strict = true;
+        break;
+      case "--only":
+        opts.only = argv[++i];
         break;
       case "--no-lint":
         opts.lint = false;
@@ -81,10 +94,14 @@ Static analyzer for Convex: ReturnsValidationError drift + best-practice lints.
 
 Usage:
   convex-doctor [options]
+  convex-doctor groups [options]      List fixable groups (one per rule code)
+  convex-doctor agent-guide           Print the agentic fix-loop recipe
 
 Options:
   --convex-dir <path>      Path to convex/ directory. Default: convex
   --schema <path>          Path to schema.ts. Default: <convex-dir>/schema.ts
+  --only <code|category>   Restrict the report to one rule code (e.g. AWAIT_IN_LOOP)
+                           or category (e.g. performance) — the agentic unit of work.
   --include-unanalyzed     Print INFO entries for handlers that couldn't be statically analyzed
   --json                   Emit JSON instead of text
   --strict                 Exit nonzero if any warnings are present
@@ -113,8 +130,96 @@ Exit codes:
 `);
 }
 
-const opts = parseArgs(process.argv.slice(2));
+const AGENT_GUIDE = `convex-doctor — agentic fix loop
+
+Fix one rule code at a time. A "group" is every issue sharing a code; the fix
+inside a group is one repeatable recipe. Lock a group, fix every site, verify by
+re-scanning, commit, then move to the next. (If the tool isn't installed locally,
+replace \`convex-doctor\` below with \`bunx @fagnersales/convex-doctor\`.)
+
+LOOP
+  1. List groups, highest priority first:
+       convex-doctor groups --json
+     If "done": true (groupCount 0) — stop, the codebase is clean.
+
+  2. Lock the TOP group. Read its "code" and "autofix" tag:
+       mechanical — the edit is fully determined; apply it directly.
+       guided     — deterministic recipe; read the handler/schema context first.
+       manual     — architectural/judgment; reason carefully, ask if unsure.
+
+  3. Load that group's work list:
+       convex-doctor --only <CODE> --json
+     Each issue carries filePath, line, function, message, why, fix, fixCode
+     (before/after/add/remove), pointerLine/Column/Length, docUrl. Fix every site.
+
+  4. VERIFY — re-scan the same group:
+       convex-doctor --only <CODE> --json
+     Its issue list must be empty before you continue. Re-running also surfaces
+     any NEW issue your edit introduced.
+
+  5. GREEN-GATE — run the project's own checks (whatever it uses), e.g.:
+       bun run typecheck     (or tsc --noEmit, or the project lint/test step)
+
+  6. COMMIT this group alone:
+       git add -A
+       git commit -m "fix(convex): resolve all <CODE> (<n> sites)"
+
+  7. Go to 1.
+
+RULES OF ENGAGEMENT
+  • One group per commit — never mix codes in a single commit.
+  • Always re-scan (step 4) before committing — it is the proof the fix landed.
+  • Prefer fixCode when present; otherwise follow "fix" + the docUrl recipe.
+  • If a "manual" group needs a design decision you cannot make, skip it, finish
+    the rest, and report what you skipped and why.
+`;
+
+const argv = process.argv.slice(2);
+// A leading non-flag token is a subcommand (`groups` / `agent-guide`).
+const subcommand = argv[0] && !argv[0].startsWith("-") ? argv[0] : null;
+
+if (subcommand === "agent-guide") {
+  process.stdout.write(AGENT_GUIDE);
+  process.exit(0);
+}
+
+const opts = parseArgs(argv);
+
+if (subcommand === "groups") {
+  const result = run(opts);
+  if (opts.format === "json") {
+    process.stdout.write(reportGroupsJson(result.issues, result.scannedFunctions) + "\n");
+  } else {
+    process.stdout.write(
+      reportGroupsText(result.issues, result.scannedFunctions, {
+        convexDir: opts.convexDir,
+        color: process.stdout.isTTY ?? false,
+      }),
+    );
+  }
+  process.exit(exitCode(result, opts.strict));
+}
+
 const result = run(opts);
+
+// `--only <code|category>` — narrow to a single fixable group. Re-summarize so
+// the headline, tally, and exit code reflect just the selected group.
+if (opts.only) {
+  const sel = opts.only;
+  const isCategory = (CATEGORY_ORDER as readonly string[]).includes(sel);
+  const isCode = Object.prototype.hasOwnProperty.call(RULE_META, sel);
+  if (!isCategory && !isCode) {
+    console.error(
+      `--only: unknown code or category "${sel}". Run \`convex-doctor groups\` to see the available groups.`,
+    );
+    process.exit(2);
+  }
+  const filtered = result.issues.filter((i) =>
+    isCategory ? (i.category ?? RULE_META[i.code].category) === sel : i.code === sel,
+  );
+  result.issues = filtered;
+  result.summary = summarize(filtered, result.scannedFunctions);
+}
 
 if (opts.deadOnly) {
   if (opts.format === "json") {

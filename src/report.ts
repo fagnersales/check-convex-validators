@@ -1,7 +1,14 @@
 import { readFileSync } from "node:fs";
 import { resolve as pathResolve, relative as pathRelative } from "node:path";
-import type { Issue, IssueCode, RunResult, RunSummary, Timings } from "./types.ts";
-import { CATEGORY_LABEL, CATEGORY_ORDER, RULE_META, type DiagCategory } from "./rules.ts";
+import type { Issue, IssueCode, IssueSeverity, RunResult, RunSummary, Timings } from "./types.ts";
+import {
+  AUTOFIX,
+  CATEGORY_LABEL,
+  CATEGORY_ORDER,
+  RULE_META,
+  type AutofixCapability,
+  type DiagCategory,
+} from "./rules.ts";
 
 export interface ReportOptions {
   /** convex dir, used to render project-relative paths + the re-run command. */
@@ -390,6 +397,138 @@ export function reportJson(result: RunResult): string {
     null,
     2,
   );
+}
+
+// ── Groups (agentic loop unit) ──────────────────────────────────────────────
+
+/**
+ * One fixable group = all issues sharing a rule code. The agentic loop locks one
+ * group at a time, fixes every site, re-scans, and commits. Ordered by
+ * `priority` (errors before warnings before info; within a severity, by the
+ * category order) so the agent always takes the top entry.
+ */
+export interface IssueGroup {
+  code: IssueCode;
+  title: string;
+  category: DiagCategory;
+  /** Most severe severity present in the group — drives priority. */
+  severity: IssueSeverity;
+  count: number;
+  errors: number;
+  warns: number;
+  infos: number;
+  /** Distinct files the group touches. */
+  files: number;
+  /** How much judgment a fix needs: mechanical | guided | manual. */
+  autofix: AutofixCapability;
+  /** Lower = fix first. */
+  priority: number;
+  why: string;
+  fixHint: string;
+  docUrl: string;
+}
+
+export function computeGroups(issues: Issue[]): IssueGroup[] {
+  const byCode = new Map<IssueCode, Issue[]>();
+  for (const i of issues) {
+    if (!byCode.has(i.code)) byCode.set(i.code, []);
+    byCode.get(i.code)!.push(i);
+  }
+  const groups: IssueGroup[] = [];
+  for (const [code, arr] of byCode) {
+    const meta = RULE_META[code];
+    let errors = 0;
+    let warns = 0;
+    let infos = 0;
+    const files = new Set<string>();
+    for (const i of arr) {
+      if (i.severity === "error") errors++;
+      else if (i.severity === "warn") warns++;
+      else infos++;
+      files.add(i.filePath);
+    }
+    const severity: IssueSeverity = errors > 0 ? "error" : warns > 0 ? "warn" : "info";
+    const catIdx = CATEGORY_ORDER.indexOf(meta.category);
+    groups.push({
+      code,
+      title: meta.title,
+      category: meta.category,
+      severity,
+      count: arr.length,
+      errors,
+      warns,
+      infos,
+      files: files.size,
+      autofix: AUTOFIX[code],
+      priority: SEV_RANK[severity] * 100 + (catIdx < 0 ? 99 : catIdx),
+      why: meta.why,
+      fixHint: meta.fixHint,
+      docUrl: meta.docUrl,
+    });
+  }
+  groups.sort(
+    (a, b) => a.priority - b.priority || b.count - a.count || a.code.localeCompare(b.code),
+  );
+  return groups;
+}
+
+export function reportGroupsJson(issues: Issue[], scannedFunctions: number): string {
+  const groups = computeGroups(issues);
+  return JSON.stringify(
+    {
+      schemaVersion: 1,
+      scannedFunctions,
+      remaining: issues.length,
+      groupCount: groups.length,
+      done: groups.length === 0,
+      groups,
+    },
+    null,
+    2,
+  );
+}
+
+export function reportGroupsText(
+  issues: Issue[],
+  scannedFunctions: number,
+  opts: ReportOptions = {},
+): string {
+  const paint = painter(opts.color ?? false);
+  const groups = computeGroups(issues);
+  if (groups.length === 0) {
+    return `${paint("green", "✓")} ${paint("bold", "No groups — nothing to fix.")} (${scannedFunctions} functions scanned)\n`;
+  }
+  const lines: string[] = [];
+  lines.push("");
+  lines.push(
+    `  ${paint("bold", "convex-doctor")} ${paint("gray", "· fixable groups (highest priority first)")}`,
+  );
+  lines.push("");
+  const sevPaint = (s: IssueSeverity, t: string) =>
+    paint(s === "error" ? "red" : s === "warn" ? "yellow" : "blue", t);
+  let n = 0;
+  for (const g of groups) {
+    n++;
+    const icon = SEV_META[g.severity].icon;
+    const counts =
+      `${g.count} in ${g.files} file${g.files === 1 ? "" : "s"}` +
+      (g.errors && (g.warns || g.infos) ? ` (${g.errors} err)` : "");
+    lines.push(
+      `  ${String(n).padStart(2)}. ${sevPaint(g.severity, icon)} ${paint("bold", g.code)} ` +
+        `${paint("gray", "·")} ${paint("magenta", g.autofix)} ${paint("gray", "·")} ${counts}`,
+    );
+    lines.push(`      ${paint("gray", g.title)}`);
+    lines.push(
+      `      ${paint("cyan", `convex-doctor --only ${g.code}` + (opts.convexDir ? ` --convex-dir ${opts.convexDir}` : ""))}`,
+    );
+    lines.push("");
+  }
+  lines.push(
+    `  ${paint("gray", `${groups.length} group(s). Lock the top one, fix every site, re-run --only <CODE> to verify, commit, repeat.`)}`,
+  );
+  lines.push(`  ${paint("gray", "Loop recipe:")} ${paint("cyan", "convex-doctor agent-guide")}`);
+  lines.push("");
+  return lines.join("\n");
 }
 
 export function exitCode(result: RunResult, strict: boolean): number {

@@ -96,8 +96,11 @@ bunx @fagnersales/convex-doctor --convex-dir convex --dead-only --ignore-dead 'm
 ## CLI
 
 ```
+groups                   List fixable groups (one per rule code), priority-ordered
+agent-guide              Print the agentic fix-loop recipe
 --convex-dir <path>      Path to convex/ directory. Default: convex
 --schema <path>          Path to schema.ts. Default: <convex-dir>/schema.ts
+--only <code|category>   Restrict the report to one rule code or category (the agentic unit)
 --include-unanalyzed     Print INFO entries for unanalyzed handlers
 --json                   Emit JSON instead of text
 --strict                 Exit nonzero if any warnings are present
@@ -110,6 +113,33 @@ bunx @fagnersales/convex-doctor --convex-dir convex --dead-only --ignore-dead 'm
 ```
 
 Exit codes: `0` no errors (and no warnings under `--strict`), `1` errors found (or warnings under `--strict`), `2` bad arguments.
+
+## Agentic usage
+
+convex-doctor is built to be driven by a coding agent. Instead of dumping every failing file at once, work **one rule code at a time**: a _group_ is all issues sharing a code, and the fix within a group is one repeatable recipe. The agent locks a group, fixes every site, re-scans to verify, commits, and moves to the next — a loop that converges to zero with clean, reviewable, per-group commits.
+
+```bash
+# 1. the menu — groups, highest priority first (errors → warnings → info)
+bunx @fagnersales/convex-doctor groups --json
+
+# 2. the locked group's full work-list (rich per-issue fix payload)
+bunx @fagnersales/convex-doctor --only AWAIT_IN_LOOP --json
+
+# 3. the loop recipe itself, for the agent to self-orient
+bunx @fagnersales/convex-doctor agent-guide
+```
+
+`groups --json` returns `{ done, groupCount, remaining, groups[] }`. Each group carries `code`, `severity`, `count`, `files`, `priority`, and an **`autofix`** capability tag telling the agent how hard to think:
+
+| `autofix` | Meaning |
+| --- | --- |
+| `mechanical` | The diagnostic fully determines the edit (remove/move a line). Safe to apply without reading surrounding code. |
+| `guided` | A deterministic recipe, but the agent must read local context (the field's schema type, the loop body, the query chain) to write it. |
+| `manual` | Architectural / cross-file / data-migration judgment. Reason carefully; may need to ask. |
+
+`--only <code|category>` emits just that group's issues with the full per-issue payload (`message`, `why`, `fixCode`, `pointerLine/Column/Length`, `docUrl`) and re-summarizes so the headline and exit code reflect only the selected group — re-run it after editing to **verify the group is clean before committing**.
+
+In Claude Code, the [`/convex-fix`](skills/convex-fix/SKILL.md) skill drives this whole loop end to end.
 
 ## Programmatic API
 
