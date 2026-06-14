@@ -325,7 +325,10 @@ export const AUTOFIX: Record<Issue["code"], AutofixCapability> = {
   CRON_PUBLIC_FN: "guided",
   DUPLICATE_CRON_ID: "guided",
   CTX_RUN_IN_QUERY_OR_MUTATION: "guided",
-  REDUNDANT_INDEX: "guided",
+  // The edit (drop the shorter index) is trivial, but deciding *whether* to drop
+  // needs whole-program judgment — a flagged prefix may be kept for newest-first
+  // ordering, and dropping it silently changes query results. So: manual.
+  REDUNDANT_INDEX: "manual",
   SCHEMA_VALIDATION_DISABLED: "manual",
 };
 

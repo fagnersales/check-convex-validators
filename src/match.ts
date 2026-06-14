@@ -18,8 +18,18 @@ export function matchFunction(fn: FunctionInfo, schema: SchemaModel): Issue[] {
 
   const branches = unfoldUnion(fn.returnsValidator).map((b) => resolveDocRefBranch(b, schema));
 
+  // Fields the handler adds on ANY return path (e.g. `{ ...row, qr }` on the
+  // pending branch only). STALE_FIELD is a handler-wide question: a validator
+  // field produced by some path is not stale, even when other paths omit it.
+  const handlerAdds = new Set<string>();
   for (const intent of fn.intents) {
-    issues.push(...matchIntentAgainstUnion(fn, intent, branches, schema));
+    if ("add" in intent && intent.add) {
+      for (const k of intent.add.keys()) handlerAdds.add(k);
+    }
+  }
+
+  for (const intent of fn.intents) {
+    issues.push(...matchIntentAgainstUnion(fn, intent, branches, schema, handlerAdds));
   }
 
   return issues;
@@ -73,6 +83,7 @@ function matchIntentAgainstUnion(
   intent: ReturnIntent,
   branches: Shape[],
   schema: SchemaModel,
+  handlerAdds: Set<string>,
 ): Issue[] {
   // v.any() accepts anything — no diff to compute.
   if (hasAny(branches)) return [];
@@ -140,12 +151,15 @@ function matchIntentAgainstUnion(
       );
       const matched = objectBranches.find((b) => objectIsForTable(b, intent.table));
       if (matched) {
-        return [...nullIssues, ...diffRowAgainstObject(fn, intent, matched, schema)];
+        return [...nullIssues, ...diffRowAgainstObject(fn, intent, matched, schema, handlerAdds)];
       }
       if (objectBranches.length === 1) {
         // Single object branch — diff against it even if `_id` table is
         // ambiguous (e.g. ctx.db.get with an un-inferrable id).
-        return [...nullIssues, ...diffRowAgainstObject(fn, intent, objectBranches[0]!, schema)];
+        return [
+          ...nullIssues,
+          ...diffRowAgainstObject(fn, intent, objectBranches[0]!, schema, handlerAdds),
+        ];
       }
       if (objectBranches.length === 0) {
         if (hasOpaqueBranch(branches)) return nullIssues; // opaque branch may be the object (C6)
@@ -209,7 +223,7 @@ function matchIntentAgainstUnion(
         add: intent.add,
         nullable: false,
       };
-      return diffRowAgainstObject(fn, synthetic, inner, schema);
+      return diffRowAgainstObject(fn, synthetic, inner, schema, handlerAdds);
     }
 
     case "paginated": {
@@ -246,7 +260,9 @@ function matchIntentAgainstUnion(
       }
       // Handler explicitly assigned `page: <expr>` (e.g. `{...result, page: pageWithUrls}`).
       if (intent.pageOverride) {
-        issues.push(...matchIntentAgainstUnion(fn, intent.pageOverride, [page.shape], schema));
+        issues.push(
+          ...matchIntentAgainstUnion(fn, intent.pageOverride, [page.shape], schema, handlerAdds),
+        );
         return issues;
       }
       if (page.shape.element.kind !== "object") {
@@ -275,7 +291,7 @@ function matchIntentAgainstUnion(
         add: new Map(),
         nullable: false,
       };
-      issues.push(...diffRowAgainstObject(fn, synthetic, page.shape.element, schema));
+      issues.push(...diffRowAgainstObject(fn, synthetic, page.shape.element, schema, handlerAdds));
       return issues;
     }
 
@@ -317,7 +333,9 @@ function matchIntentAgainstUnion(
       const innerBranches = unfoldUnion(arr.element);
       // Diff every distinct element branch (covers `.map(x => cond ? a : b)`).
       const elements = intent.elements ?? [intent.element];
-      return elements.flatMap((el) => matchIntentAgainstUnion(fn, el, innerBranches, schema));
+      return elements.flatMap((el) =>
+        matchIntentAgainstUnion(fn, el, innerBranches, schema, handlerAdds),
+      );
     }
 
     case "idValue": {
@@ -415,6 +433,7 @@ function diffRowAgainstObject(
   intent: Extract<ReturnIntent, { kind: "row" }>,
   validatorObj: Shape & { kind: "object" },
   schema: SchemaModel,
+  handlerAdds: Set<string> = new Set(),
 ): Issue[] {
   const issues: Issue[] = [];
   const table = schema.tables.get(intent.table);
@@ -544,6 +563,10 @@ function diffRowAgainstObject(
     if (k.startsWith("__spread:")) continue; // synthetic, never user-facing
     if (expectedAfterDrop.has(k)) continue;
     if (intent.add.has(k)) continue;
+    // Added on another return path (e.g. `{ ...row, qr }` on the pending branch
+    // only) and declared optional → legitimate conditional enrichment, not stale.
+    // A *required* field still flags here: a path that omits it genuinely throws.
+    if (handlerAdds.has(k) && vf.optional) continue;
     issues.push(
       makeIssue("STALE_FIELD", {
         severity: vf.optional ? "info" : "error",

@@ -417,6 +417,21 @@ describe("positive-guard narrowing in consequent (C4)", () => {
   });
 });
 
+describe("conditional handler addition is not stale (C5)", () => {
+  // spokpay charges.ts false positive: a validator field added via `{ ...row, x }`
+  // on ONE return branch (and omitted on another) where v.optional declares it.
+  test("a field added on one branch + optional in validator does NOT fire STALE_FIELD", () => {
+    const issues = fnIssues("conditional-add", "getChargeConditionalAdd");
+    expect(issues.map((i) => i.code)).not.toContain("STALE_FIELD");
+    expect(issues).toEqual([]);
+  });
+  // Soundness: a field produced by NO path is still stale.
+  test("a field produced by no path still fires STALE_FIELD", () => {
+    const codes = fnIssues("conditional-add", "getChargeStaleControl").map((i) => i.code);
+    expect(codes).toContain("STALE_FIELD");
+  });
+});
+
 describe("nullish fallback nullability (C2)", () => {
   test("`a ?? <non-null>` → no NULL_BRANCH_MISSING", () => {
     expect(fnIssues("nullish-fallback", "fbNonNull")).toEqual([]);
